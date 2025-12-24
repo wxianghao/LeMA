@@ -2,16 +2,14 @@
 
 ## Get Started
 
-### Install Dependencies
+### Install dependencies
 ```bash
 # cuPyNumeric, Legate
 CONDA_OVERRIDE_CUDA="12.2" \
   conda install -c conda-forge -c legate cupynumeric
-
-# PyTorch
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
-### Install LeMA
+### Build LeMA
 ```bash
-
+  pip install -e .
 ```
+
