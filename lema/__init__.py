@@ -1,1 +1,1 @@
-from .lema import test
+from .lema import LeMA
