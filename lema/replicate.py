@@ -9,7 +9,7 @@ def _bind_flat_params(flat_params, params, params_host):
     for name, p_host in params_host.items():
         p_device = params[name]
         end_idx = start_idx + p_host.numel()
-        p_device.data = flat_params[start_idx:end_idx]
+        p_device.data = flat_params[start_idx:end_idx].view_as(p_host.data)
         start_idx = end_idx
 
 
