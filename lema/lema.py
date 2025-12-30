@@ -1,6 +1,7 @@
 import torch
 from .replicate import replicate_tensor, replicate_model
-from .util import unflatten_params
+from .util import unflatten_params, ceil_div
+from .constant import DEFAULT_SLICE_PER_DEVICE
 
 class LeMA:
     def __init__(self, model_host, devices, residual_fn, opt_type="fp32"):
@@ -26,10 +27,33 @@ class LeMA:
         target_host: torch.Tensor,
         slice_size: int = None,
     ):
+        # Get all tensors for evaluating the Jacobian
         device_input_map = replicate_tensor(input_host, self.devices)
         device_target_map = replicate_tensor(target_host, self.devices)
         device_output_map = self._forward(device_input_map)
-        self._compute_jacobian(device_input_map, device_target_map)
+        
+        # Determine the shapes
+        batch_size = target_host.shape[0]
+
+        # Determine the slice size
+        num_devices = len(self.devices)
+        if slice_size is None:
+            slice_size = ceil_div(batch_size, num_devices * DEFAULT_SLICE_PER_DEVICE)
+        elif slice_size <= 0:
+            raise ValueError('slice_size should be a positive integer!')
+
+        # Compute each Jacobian slice
+        start_idx = 0
+        device_idx = 0
+        while start_idx < batch_size:
+            end_idx = start_idx + slice_size
+            device = self.devices[device_idx]
+            input, target = device_input_map[device], device_target_map[device]
+            flat_params = self.device_flat_params_map[device]
+            input_slice, target_slice = input[start_idx:end_idx], target[start_idx:end_idx]
+            J = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
+            start_idx = end_idx
+            device_idx = (device_idx + 1) % num_devices
 
     @torch.no_grad()
     def _forward(self, device_input_map):
@@ -39,12 +63,6 @@ class LeMA:
             output = torch.func.functional_call(self.model_host, params, input)
             device_output_map[device] = output
 
-    def _compute_jacobian(self, device_input_map, device_target_map):
-        for device in self.devices:
-            input, target = device_input_map[device], device_target_map[device]
-            flat_params = self.device_flat_params_map[device]
-            J = self._compute_jacobian_stateless(flat_params, input, target)
-
     def _compute_residual_stateless(self, flat_params, input, target):
         # Unflatten the flat parameters for stateless evaluation
         params = unflatten_params(flat_params, dict(self.model_host.named_parameters()))
@@ -53,7 +71,7 @@ class LeMA:
         return self.residual_fn(output, target)
 
     @torch.no_grad()
-    def _compute_jacobian_stateless(self, params, input, target):
+    def _compute_jacobian_stateless(self, flat_params, input, target):
         f = lambda p: self._compute_residual_stateless(p, input, target)
-        J = torch.func.jacrev(f)(params)
+        J = torch.func.jacrev(f)(flat_params)
         return J

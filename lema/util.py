@@ -1,5 +1,8 @@
 import torch
 
+def ceil_div(a: int, b: int):
+    return (a + b - 1) // b
+
 def unflatten_params(flat_params, params_template):
     params_size = [p.numel() for _ , p in params_template.items()]
     params_list = torch.split(flat_params, params_size)
