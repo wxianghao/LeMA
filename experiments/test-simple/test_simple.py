@@ -1,4 +1,4 @@
-from lema import LeMA
+from lema import LeMA, get_available_gpus
 import torch
 import nvtx
 
@@ -14,12 +14,12 @@ class SimpleDense(torch.nn.Module):
 
 
 # Get devices
-device_count = torch.cuda.device_count()
-devices = [torch.device(f"cuda:{i}") for i in range(device_count)]
+devices = get_available_gpus()
+# print(devices)
 
 # Prepare data
-x = torch.randn(20000, 784, pin_memory=True)
-y = torch.randn(20000, 10, pin_memory=True)
+x = torch.randn(5000, 784, pin_memory=True)
+y = torch.randn(5000, 10, pin_memory=True)
 
 # Create model
 residual_fn = lambda a, b: torch.sum(a - b, axis=1).flatten()

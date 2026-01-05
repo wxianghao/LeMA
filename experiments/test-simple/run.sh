@@ -1,0 +1,1 @@
+legate --gpus 2 --fbmem 20000 test_simple.py
