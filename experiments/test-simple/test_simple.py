@@ -2,6 +2,8 @@ from lema import LeMA, get_available_gpus
 import torch
 import nvtx
 
+torch.manual_seed(12)
+
 class SimpleDense(torch.nn.Module):
     def __init__(self):
         super().__init__()

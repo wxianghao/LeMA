@@ -51,8 +51,6 @@ class LeMA:
         device_input_map = replicate_tensor(input_host, self.devices)
         device_target_map = replicate_tensor(target_host, self.devices)
         device_output_map = self._forward(device_input_map)
-
-        # Compute residuals
         residual = self._compute_residual(device_output_map, device_target_map)
         
         # Determine the shapes
@@ -66,55 +64,66 @@ class LeMA:
         elif slice_size <= 0:
             raise ValueError('slice_size should be a positive integer!')
 
-        # Compute each Jacobian slice
-        J_slices = []
-        start_idx = 0
-        device_idx = 0
-        while start_idx < batch_size:
-            end_idx = start_idx + slice_size
-            device = self.devices[device_idx]
-            input, target = device_input_map[device], device_target_map[device]
-            flat_params = self.device_flat_params_map[device]
-            input_slice, target_slice = input[start_idx:end_idx], target[start_idx:end_idx]
-            J_slice = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
-            J_slices.append((start_idx, end_idx, J_slice))
-            start_idx = end_idx
-            device_idx = (device_idx + 1) % num_devices
+        # Compute all the Jacobian slices
+        J_slices = self._compute_jacobian_slices(device_input_map, device_target_map, slice_size, batch_size)
 
-        '''Transfer Jacobian'''
+        # Gather Jacobian slices into cupynumeric
         @task(variants=(VariantCode.GPU,))
-        def send_jacobian_to_cupynumeric(
-            ctx: TaskContext, J_slice_legate: OutputArray
-        ) -> None:
-            J_slice_cupy = cupy.asarray(J_slice_legate)
-            task_row, task_col = ctx.task_index
-            assert task_row == 0
-            start_col = task_col * (model_size // len(self.devices))
-            end_col = start_col + model_size // len(self.devices)
-            for start_row, end_row, J_slice_torch in J_slices:
-                J_slice_cupy[start_row:end_row,:] = cupy.asarray(J_slice_torch)[:,start_col:end_col]
-
-        # Transfer Jacobian slices to cuPyNumeric's GPU
+        def send_jacobian_to_cupynumeric(ctx: TaskContext, slice_legate: OutputArray):
+            lo_row, lo_col = slice_legate.domain().lo
+            _, hi_col = slice_legate.domain().hi
+            assert lo_row == 0
+            slice_cupy = cupy.asarray(slice_legate)
+            for start_row, end_row, slice_torch in J_slices:
+                # print(slice_cupy[start_row:end_row, :].shape, slice_torch[:, lo_col:hi_col+1].shape)
+                slice_cupy[start_row:end_row, :] = cupy.asarray(slice_torch)[:, lo_col:hi_col+1]
         J = np.empty((batch_size, model_size), self.opt_type)
         send_jacobian_to_cupynumeric(J)
 
-        '''Transfer residual'''
-        # TODO: use p2p communication
-        residual_cupy = cupy.asarray(residual)
-        r = np.asarray(residual_cupy.get())
+        # Send residual to cupynumeric
+        @task(variants=(VariantCode.GPU,))
+        def send_residual_to_cupynumeric(ctx: TaskContext, residual_legate: OutputArray):
+            lo, = residual_legate.domain().lo
+            hi, = residual_legate.domain().hi
+            residual_cupy = cupy.asarray(residual_legate)
+            residual_cupy[lo:hi] = cupy.asarray(residual)[lo:hi]
+        r = np.empty(batch_size, self.opt_type)
+        send_residual_to_cupynumeric(r)
 
-        # Build equation
-        if batch_size > model_size:
-            JJ = J.T @ J
-            rhs = J.T @ r
-        else:
-            JJ = J @ J.T
-            rhs = r
+        # '''Transfer Jacobian'''
+        # @task(variants=(VariantCode.GPU,))
+        # def send_jacobian_to_cupynumeric(
+        #     ctx: TaskContext, J_slice_legate: OutputArray
+        # ) -> None:
+        #     J_slice_cupy = cupy.asarray(J_slice_legate)
+        #     task_row, task_col = ctx.task_index
+        #     assert task_row == 0
+        #     start_col = task_col * (model_size // len(self.devices))
+        #     end_col = start_col + model_size // len(self.devices)
+        #     for start_row, end_row, J_slice_torch in J_slices:
+        #         J_slice_cupy[start_row:end_row,:] = cupy.asarray(J_slice_torch)[:,start_col:end_col]
 
-        # Normalization
-        normalization_factor = 1.0 / batch_size
-        np.multiply(normalization_factor, JJ, out=JJ)
-        np.multiply(normalization_factor, rhs, out=rhs)
+        # # Transfer Jacobian slices to cuPyNumeric's GPU
+        # J = np.empty((batch_size, model_size), self.opt_type)
+        # send_jacobian_to_cupynumeric(J)
+
+        # '''Transfer residual'''
+        # # TODO: use p2p communication
+        # residual_cupy = cupy.asarray(residual)
+        # r = np.asarray(residual_cupy.get())
+
+        # # Build equation
+        # if batch_size > model_size:
+        #     JJ = J.T @ J
+        #     rhs = J.T @ r
+        # else:
+        #     JJ = J @ J.T
+        #     rhs = r
+
+        # # Normalization
+        # normalization_factor = 1.0 / batch_size
+        # np.multiply(normalization_factor, JJ, out=JJ)
+        # np.multiply(normalization_factor, rhs, out=rhs)
 
     @torch.no_grad()
     def _forward(self, device_input_map):
@@ -136,6 +145,23 @@ class LeMA:
         # Evaluate the output
         output = torch.func.functional_call(self.model_host, params, input)
         return self.residual_fn(output, target)
+
+    def _compute_jacobian_slices(self, device_input_map, device_target_map, slice_size, batch_size):
+        slices = []
+        start_idx = 0
+        device_idx = 0
+        num_devices = len(self.devices)
+        while start_idx < batch_size:
+            end_idx = start_idx + slice_size
+            device = self.devices[device_idx]
+            input, target = device_input_map[device], device_target_map[device]
+            flat_params = self.device_flat_params_map[device]
+            input_slice, target_slice = input[start_idx:end_idx], target[start_idx:end_idx]
+            J_slice = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
+            slices.append((start_idx, end_idx, J_slice))
+            start_idx = end_idx
+            device_idx = (device_idx + 1) % num_devices
+        return slices
 
     @torch.no_grad()
     def _compute_jacobian_stateless(self, flat_params, input, target):
