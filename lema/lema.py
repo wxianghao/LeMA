@@ -21,8 +21,17 @@ class LeMA:
         ), "Model should be on the host!"
         self.model_host = model_host
         self.devices = devices
-        self.residual_fn = residual_fn
         self.opt_type = _query_numpy_type(opt_type)
+
+        # Construct residual function with flattened output
+        def flat_residual_fn(output, target):
+            return torch.flatten(residual_fn(output, target))
+        self.residual_fn = flat_residual_fn
+
+        # Construct loss function
+        def loss_fn(output, target):
+            return self.residual_fn(output, target).square().mean()
+        self.loss_fn = loss_fn
 
         # Replicate the model on the given devices
         self.device_flat_params_map, self.device_params_map = replicate_model(
@@ -42,6 +51,9 @@ class LeMA:
         device_input_map = replicate_tensor(input_host, self.devices)
         device_target_map = replicate_tensor(target_host, self.devices)
         device_output_map = self._forward(device_input_map)
+
+        # Compute residuals
+        residual = self._compute_residual(device_output_map, device_target_map)
         
         # Determine the shapes
         batch_size = target_host.shape[0]
@@ -64,13 +76,14 @@ class LeMA:
             input, target = device_input_map[device], device_target_map[device]
             flat_params = self.device_flat_params_map[device]
             input_slice, target_slice = input[start_idx:end_idx], target[start_idx:end_idx]
-            J = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
-            J_slices.append((start_idx, end_idx, J))
+            J_slice = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
+            J_slices.append((start_idx, end_idx, J_slice))
             start_idx = end_idx
             device_idx = (device_idx + 1) % num_devices
 
+        '''Transfer Jacobian'''
         @task(variants=(VariantCode.GPU,))
-        def send_to_cupynumeric(
+        def send_jacobian_to_cupynumeric(
             ctx: TaskContext, J_slice_legate: OutputArray
         ) -> None:
             J_slice_cupy = cupy.asarray(J_slice_legate)
@@ -82,8 +95,26 @@ class LeMA:
                 J_slice_cupy[start_row:end_row,:] = cupy.asarray(J_slice_torch)[:,start_col:end_col]
 
         # Transfer Jacobian slices to cuPyNumeric's GPU
-        J_arr = np.empty((batch_size, model_size), self.opt_type)
-        send_to_cupynumeric(J_arr)
+        J = np.empty((batch_size, model_size), self.opt_type)
+        send_jacobian_to_cupynumeric(J)
+
+        '''Transfer residual'''
+        # TODO: use p2p communication
+        residual_cupy = cupy.asarray(residual)
+        r = np.asarray(residual_cupy.get())
+
+        # Build equation
+        if batch_size > model_size:
+            JJ = J.T @ J
+            rhs = J.T @ r
+        else:
+            JJ = J @ J.T
+            rhs = r
+
+        # Normalization
+        normalization_factor = 1.0 / batch_size
+        np.multiply(normalization_factor, JJ, out=JJ)
+        np.multiply(normalization_factor, rhs, out=rhs)
 
     @torch.no_grad()
     def _forward(self, device_input_map):
@@ -92,6 +123,12 @@ class LeMA:
             params = self.device_params_map[device]
             output = torch.func.functional_call(self.model_host, params, input)
             device_output_map[device] = output
+        return device_output_map
+
+    def _compute_residual(self, device_output_map, device_target_map):
+        a_device = self.devices[0]
+        output, target = device_output_map[a_device], device_target_map[a_device]
+        return self.residual_fn(output, target)
 
     def _compute_residual_stateless(self, flat_params, input, target):
         # Unflatten the flat parameters for stateless evaluation

@@ -31,7 +31,7 @@ for device in devices:
 # Test multiple steps
 # start_event = torch.cuda.Event()
 # end_event = torch.cuda.Event()
-for _ in range(2):
+for _ in range(3):
     # start_event.record()
     lema_optim.step(x, y)
     # end_event.record()
