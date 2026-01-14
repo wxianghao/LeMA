@@ -90,28 +90,6 @@ class LeMA:
         r = np.empty(batch_size, self.opt_type)
         send_residual_to_cupynumeric(r)
 
-        # '''Transfer Jacobian'''
-        # @task(variants=(VariantCode.GPU,))
-        # def send_jacobian_to_cupynumeric(
-        #     ctx: TaskContext, J_slice_legate: OutputArray
-        # ) -> None:
-        #     J_slice_cupy = cupy.asarray(J_slice_legate)
-        #     task_row, task_col = ctx.task_index
-        #     assert task_row == 0
-        #     start_col = task_col * (model_size // len(self.devices))
-        #     end_col = start_col + model_size // len(self.devices)
-        #     for start_row, end_row, J_slice_torch in J_slices:
-        #         J_slice_cupy[start_row:end_row,:] = cupy.asarray(J_slice_torch)[:,start_col:end_col]
-
-        # # Transfer Jacobian slices to cuPyNumeric's GPU
-        # J = np.empty((batch_size, model_size), self.opt_type)
-        # send_jacobian_to_cupynumeric(J)
-
-        # '''Transfer residual'''
-        # # TODO: use p2p communication
-        # residual_cupy = cupy.asarray(residual)
-        # r = np.asarray(residual_cupy.get())
-
         # # Build equation
         # if batch_size > model_size:
         #     JJ = J.T @ J
