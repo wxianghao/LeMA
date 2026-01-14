@@ -2,6 +2,7 @@ import cupynumeric as np
 import legate
 import torch
 import cupy
+import warnings
 from legate.core import TaskContext, VariantCode
 from legate.core.task import task, InputArray, OutputArray
 from .replicate import replicate_tensor, replicate_model
@@ -23,6 +24,9 @@ class LeMA:
         self.devices = devices
         self.opt_type = _query_numpy_type(opt_type)
 
+        # Damping
+        self.damping_factor = 1e-3
+
         # Construct residual function with flattened output
         def flat_residual_fn(output, target):
             return torch.flatten(residual_fn(output, target))
@@ -40,6 +44,10 @@ class LeMA:
         
         # Get total number of parameters
         self.params_size = sum([p.numel() for p in self.model_host.parameters()])
+
+        # Backup
+        self.device_flat_params_backup_map = {device : None for device in self.devices}
+        self._save_parameters()
 
     def step(
         self,
@@ -90,18 +98,64 @@ class LeMA:
         r = np.empty(batch_size, self.opt_type)
         send_residual_to_cupynumeric(r)
 
-        # # Build equation
-        # if batch_size > model_size:
-        #     JJ = J.T @ J
-        #     rhs = J.T @ r
-        # else:
-        #     JJ = J @ J.T
-        #     rhs = r
+        # Build equation
+        if batch_size > model_size:
+            JJ = J.T @ J
+            rhs = J.T @ r
+        else:
+            JJ = J @ J.T
+            rhs = r
 
-        # # Normalization
-        # normalization_factor = 1.0 / batch_size
-        # np.multiply(normalization_factor, JJ, out=JJ)
-        # np.multiply(normalization_factor, rhs, out=rhs)
+        # Normalization
+        normalization_factor = 1.0 / batch_size
+        np.multiply(normalization_factor, JJ, out=JJ)
+        np.multiply(normalization_factor, rhs, out=rhs)
+
+        # Step loop 
+        loss_val = self._compute_loss(device_output_map, device_target_map)
+        terminating = False
+        for i in range(10):
+            JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
+            solved = False
+            try:
+                updates = np.solve(JJ_damped, rhs)
+                solved = True
+            except Exception as e:
+                warnings.warn(
+                    f"Singular matrix occurs: damping_factor={self.damping_factor}"
+                )
+            if solved:
+                # Update parameters
+                if batch_size <= model_size:
+                    updates = J.T @ updates
+                self._update_parameters(updates)
+
+                # Check update criteria
+                device_output_map = self._forward(device_input_map)
+                new_loss_val = self._compute_loss(device_output_map, device_target_map)
+                if new_loss_val < loss_val:
+                    loss_val = new_loss_val
+                    # Success in updating, then damp down and save the model
+                    self.damping_factor = max(self.damping_factor * 0.1, 1e-9)
+                    self._save_parameters()
+                    break
+                else:
+                    warnings.warn("Failed attempt due to increasing loss")
+                    self._restore_parameters()
+
+            # Fail in updating, damp up
+            self.damping_factor *= 10.0
+
+            # Check termination criteria
+            terminating = self.damping_factor >= 1e9
+            if terminating:
+                # Warn and reset damping factor
+                warnings.warn("Terminated due to large damping factor")
+                self.damping_factor = 1e-3
+                break
+
+        return loss_val, terminating
+
 
     @torch.no_grad()
     def _forward(self, device_input_map):
@@ -111,6 +165,11 @@ class LeMA:
             output = torch.func.functional_call(self.model_host, params, input)
             device_output_map[device] = output
         return device_output_map
+
+    def _compute_loss(self, device_output_map, device_target_map):
+        a_device = self.devices[0]
+        output, target = device_output_map[a_device], device_target_map[a_device]
+        return self.loss_fn(output, target)
 
     def _compute_residual(self, device_output_map, device_target_map):
         a_device = self.devices[0]
@@ -146,3 +205,18 @@ class LeMA:
         f = lambda p: self._compute_residual_stateless(p, input, target)
         J = torch.func.jacrev(f)(flat_params)
         return J
+
+    @torch.no_grad()
+    def _save_parameters(self):
+        for device, p in self.device_flat_params_map.items():
+            self.device_flat_params_backup_map[device] = p.clone()
+
+    @torch.no_grad()
+    def _restore_parameters(self):
+        for device, backup in self.device_flat_params_backup_map.items():
+            self.device_flat_params_map[device].copy_(backup)
+
+    @torch.no_grad()
+    def _update_parameters(self, updates_legate):
+        for device, p in self.device_flat_params_map.items():
+            p.add_(device_update_map[device])
