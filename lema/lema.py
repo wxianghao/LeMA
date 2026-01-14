@@ -86,7 +86,7 @@ class LeMA:
             lo, = residual_legate.domain().lo
             hi, = residual_legate.domain().hi
             residual_cupy = cupy.asarray(residual_legate)
-            residual_cupy[lo:hi] = cupy.asarray(residual)[lo:hi]
+            residual_cupy[lo:hi+1] = cupy.asarray(residual)[lo:hi+1]
         r = np.empty(batch_size, self.opt_type)
         send_residual_to_cupynumeric(r)
 
