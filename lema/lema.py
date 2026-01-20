@@ -2,13 +2,11 @@ import cupynumeric as np
 import legate
 import legate.core as lg
 import torch
-import cupy
 import warnings
-from legate.core import TaskContext, VariantCode
-from legate.core.task import task, InputArray, OutputArray
 from .replicate import replicate_tensor, replicate_model
 from .utils import unflatten_params, ceil_div
 from .constant import DEFAULT_SLICE_PER_DEVICE
+from .comm import gather_to_cupynumeric, send_to_cupynumeric
 
 def _query_numpy_type(type_str):
     if type_str == 'fp32':
@@ -21,6 +19,7 @@ class LeMA:
         assert (
             next(model_host.parameters()).device.type == "cpu"
         ), "Model should be on the host!"
+
         self.model_host = model_host
         self.devices = devices
         self.opt_type = _query_numpy_type(opt_type)
@@ -74,32 +73,15 @@ class LeMA:
             raise ValueError('slice_size should be a positive integer!')
 
         # Compute all the Jacobian slices
-        J_slices = self._compute_jacobian_slices(device_input_map, device_target_map, slice_size, batch_size)
+        ranges, slices = self._compute_jacobian_slices(device_input_map, device_target_map, slice_size, batch_size)
 
         # Gather Jacobian slices into cupynumeric
-        @task(variants=(VariantCode.GPU,))
-        def send_jacobian_to_cupynumeric(ctx: TaskContext, slice_legate: OutputArray):
-            lo_row, lo_col = slice_legate.domain().lo
-            hi_row, hi_col = slice_legate.domain().hi
-            hi_row += 1
-            hi_col += 1
-
-            slice_cupy = cupy.asarray(slice_legate)
-            for start_row, end_row, slice_torch in J_slices:
-                slice_cupy[start_row:end_row, :] = cupy.asarray(slice_torch)[:, lo_col:hi_col]
         J = np.zeros((batch_size, model_size), self.opt_type)
-        send_jacobian_to_cupynumeric(J)
+        gather_to_cupynumeric(ranges, slices, J)
 
         # Send residual to cupynumeric
-        @task(variants=(VariantCode.GPU,))
-        def send_residual_to_cupynumeric(ctx: TaskContext, residual_legate: OutputArray):
-            lo, = residual_legate.domain().lo
-            hi, = residual_legate.domain().hi
-            hi += 1
-            residual_cupy = cupy.asarray(residual_legate)
-            residual_cupy[lo:hi+1] = cupy.asarray(residual)[lo:hi]
         r = np.empty(batch_size, self.opt_type)
-        send_residual_to_cupynumeric(r)
+        send_to_cupynumeric(residual, r)
 
         # Build equation
         JJ = J.T @ J
@@ -114,10 +96,11 @@ class LeMA:
         loss_val = self._compute_loss(device_output_map, device_target_map)
         for i in range(5):
             JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
+            # JJ_damped = JJ
             updates = np.linalg.solve(JJ_damped, rhs)
-            # self._update_parameters(updates)
-
+            print(updates)
             break
+        
         # terminating = False
         # for i in range(10):
         #     JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
@@ -189,7 +172,7 @@ class LeMA:
         return self.residual_fn(output, target)
 
     def _compute_jacobian_slices(self, device_input_map, device_target_map, slice_size, batch_size):
-        slices = []
+        ranges, slices = [], []
         start_idx = 0
         device_idx = 0
         num_devices = len(self.devices)
@@ -199,15 +182,12 @@ class LeMA:
             input, target = device_input_map[device], device_target_map[device]
             flat_params = self.device_flat_params_map[device]
             input_slice, target_slice = input[start_idx:end_idx], target[start_idx:end_idx]
-
-            # print(input_slice.shape, target_slice.shape)
             J_slice = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
-            # print(J_slice.shape)
-
-            slices.append((start_idx, end_idx, J_slice))
+            ranges.append((start_idx, end_idx))
+            slices.append(J_slice)
             start_idx = end_idx
             device_idx = (device_idx + 1) % num_devices
-        return slices
+        return ranges, slices
 
     @torch.no_grad()
     def _compute_jacobian_stateless(self, flat_params, input, target):
