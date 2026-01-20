@@ -1,5 +1,6 @@
 import cupynumeric as np
 import legate
+import legate.core as lg
 import torch
 import cupy
 import warnings
@@ -79,13 +80,14 @@ class LeMA:
         @task(variants=(VariantCode.GPU,))
         def send_jacobian_to_cupynumeric(ctx: TaskContext, slice_legate: OutputArray):
             lo_row, lo_col = slice_legate.domain().lo
-            _, hi_col = slice_legate.domain().hi
-            assert lo_row == 0
+            hi_row, hi_col = slice_legate.domain().hi
+            hi_row += 1
+            hi_col += 1
+
             slice_cupy = cupy.asarray(slice_legate)
             for start_row, end_row, slice_torch in J_slices:
-                # print(slice_cupy[start_row:end_row, :].shape, slice_torch[:, lo_col:hi_col+1].shape)
-                slice_cupy[start_row:end_row, :] = cupy.asarray(slice_torch)[:, lo_col:hi_col+1]
-        J = np.empty((batch_size, model_size), self.opt_type)
+                slice_cupy[start_row:end_row, :] = cupy.asarray(slice_torch)[:, lo_col:hi_col]
+        J = np.zeros((batch_size, model_size), self.opt_type)
         send_jacobian_to_cupynumeric(J)
 
         # Send residual to cupynumeric
@@ -93,68 +95,71 @@ class LeMA:
         def send_residual_to_cupynumeric(ctx: TaskContext, residual_legate: OutputArray):
             lo, = residual_legate.domain().lo
             hi, = residual_legate.domain().hi
+            hi += 1
             residual_cupy = cupy.asarray(residual_legate)
-            residual_cupy[lo:hi+1] = cupy.asarray(residual)[lo:hi+1]
+            residual_cupy[lo:hi+1] = cupy.asarray(residual)[lo:hi]
         r = np.empty(batch_size, self.opt_type)
         send_residual_to_cupynumeric(r)
 
         # Build equation
-        if batch_size > model_size:
-            JJ = J.T @ J
-            rhs = J.T @ r
-        else:
-            JJ = J @ J.T
-            rhs = r
+        JJ = J.T @ J
+        rhs = J.T @ r
 
         # Normalization
-        normalization_factor = 1.0 / batch_size
-        np.multiply(normalization_factor, JJ, out=JJ)
-        np.multiply(normalization_factor, rhs, out=rhs)
+        # normalization_factor = 1.0 / batch_size
+        # np.multiply(normalization_factor, JJ, out=JJ)
+        # np.multiply(normalization_factor, rhs, out=rhs)
 
         # Step loop 
         loss_val = self._compute_loss(device_output_map, device_target_map)
-        terminating = False
-        for i in range(10):
+        for i in range(5):
             JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
-            solved = False
-            try:
-                updates = np.solve(JJ_damped, rhs)
-                solved = True
-            except Exception as e:
-                warnings.warn(
-                    f"Singular matrix occurs: damping_factor={self.damping_factor}"
-                )
-            if solved:
-                # Update parameters
-                if batch_size <= model_size:
-                    updates = J.T @ updates
-                self._update_parameters(updates)
+            updates = np.linalg.solve(JJ_damped, rhs)
+            # self._update_parameters(updates)
 
-                # Check update criteria
-                device_output_map = self._forward(device_input_map)
-                new_loss_val = self._compute_loss(device_output_map, device_target_map)
-                if new_loss_val < loss_val:
-                    loss_val = new_loss_val
-                    # Success in updating, then damp down and save the model
-                    self.damping_factor = max(self.damping_factor * 0.1, 1e-9)
-                    self._save_parameters()
-                    break
-                else:
-                    warnings.warn("Failed attempt due to increasing loss")
-                    self._restore_parameters()
+            break
+        # terminating = False
+        # for i in range(10):
+        #     JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
+        #     solved = False
+        #     try:
+        #         updates = np.solve(JJ_damped, rhs)
+        #         solved = True
+        #     except Exception as e:
+        #         warnings.warn(
+        #             f"Singular matrix occurs: damping_factor={self.damping_factor}"
+        #         )
+        #     if solved:
+        #         # Update parameters
+        #         if batch_size <= model_size:
+        #             updates = J.T @ updates
+        #         self._update_parameters(updates)
 
-            # Fail in updating, damp up
-            self.damping_factor *= 10.0
+        #         # Check update criteria
+        #         device_output_map = self._forward(device_input_map)
+        #         new_loss_val = self._compute_loss(device_output_map, device_target_map)
+        #         if new_loss_val < loss_val:
+        #             loss_val = new_loss_val
+        #             # Success in updating, then damp down and save the model
+        #             self.damping_factor = max(self.damping_factor * 0.1, 1e-9)
+        #             self._save_parameters()
+        #             break
+        #         else:
+        #             warnings.warn("Failed attempt due to increasing loss")
+        #             self._restore_parameters()
 
-            # Check termination criteria
-            terminating = self.damping_factor >= 1e9
-            if terminating:
-                # Warn and reset damping factor
-                warnings.warn("Terminated due to large damping factor")
-                self.damping_factor = 1e-3
-                break
+        #     # Fail in updating, damp up
+        #     self.damping_factor *= 10.0
 
-        return loss_val, terminating
+        #     # Check termination criteria
+        #     terminating = self.damping_factor >= 1e9
+        #     if terminating:
+        #         # Warn and reset damping factor
+        #         warnings.warn("Terminated due to large damping factor")
+        #         self.damping_factor = 1e-3
+        #         break
+
+        # return loss_val, terminating
 
 
     @torch.no_grad()
@@ -194,7 +199,11 @@ class LeMA:
             input, target = device_input_map[device], device_target_map[device]
             flat_params = self.device_flat_params_map[device]
             input_slice, target_slice = input[start_idx:end_idx], target[start_idx:end_idx]
+
+            # print(input_slice.shape, target_slice.shape)
             J_slice = self._compute_jacobian_stateless(flat_params, input_slice, target_slice)
+            # print(J_slice.shape)
+
             slices.append((start_idx, end_idx, J_slice))
             start_idx = end_idx
             device_idx = (device_idx + 1) % num_devices
@@ -216,7 +225,8 @@ class LeMA:
         for device, backup in self.device_flat_params_backup_map.items():
             self.device_flat_params_map[device].copy_(backup)
 
-    @torch.no_grad()
-    def _update_parameters(self, updates_legate):
-        for device, p in self.device_flat_params_map.items():
-            p.add_(device_update_map[device])
+    # @torch.no_grad()
+    # def _update_parameters(self, updates_legate):
+        # for device, p in self.device_flat_params_map.items():
+            # p.add_(-device_update_map[device])
+
