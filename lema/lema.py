@@ -3,10 +3,12 @@ import legate
 import legate.core as lg
 import torch
 import warnings
+import legate.core as lg
 from .replicate import replicate_tensor, replicate_model
 from .utils import unflatten_params, ceil_div
 from .constant import DEFAULT_SLICE_PER_DEVICE
-from .comm import gather_to_cupynumeric, send_to_cupynumeric
+from .comm import gather_to_cupynumeric, send_to_cupynumeric, broadcast_to_torch
+from legate.timing import time
 
 def _query_numpy_type(type_str):
     if type_str == 'fp32':
@@ -25,7 +27,12 @@ class LeMA:
         self.opt_type = _query_numpy_type(opt_type)
 
         # Damping
-        self.damping_factor = 1e-3
+        self.damping_start = 1e-3
+        self.damping_factor = self.damping_start
+        self.damping_up = 10.0
+        self.damping_down = 0.1
+        self.damping_min = 1e-9
+        self.damping_max = 1e9
 
         # Construct residual function with flattened output
         def flat_residual_fn(output, target):
@@ -88,61 +95,50 @@ class LeMA:
         rhs = J.T @ r
 
         # Normalization
-        # normalization_factor = 1.0 / batch_size
-        # np.multiply(normalization_factor, JJ, out=JJ)
-        # np.multiply(normalization_factor, rhs, out=rhs)
+        normalization_factor = 1.0 / batch_size
+        np.multiply(normalization_factor, JJ, out=JJ)
+        np.multiply(normalization_factor, rhs, out=rhs)
 
         # Step loop 
+        terminating = False
         loss_val = self._compute_loss(device_output_map, device_target_map)
         for i in range(5):
-            JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
-            # JJ_damped = JJ
-            updates = np.linalg.solve(JJ_damped, rhs)
-            print(updates)
-            break
-        
-        # terminating = False
-        # for i in range(10):
-        #     JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
-        #     solved = False
-        #     try:
-        #         updates = np.solve(JJ_damped, rhs)
-        #         solved = True
-        #     except Exception as e:
-        #         warnings.warn(
-        #             f"Singular matrix occurs: damping_factor={self.damping_factor}"
-        #         )
-        #     if solved:
-        #         # Update parameters
-        #         if batch_size <= model_size:
-        #             updates = J.T @ updates
-        #         self._update_parameters(updates)
+            solved = False
+            # Solve update
+            try:
+                JJ_damped = JJ + self.damping_factor * np.diag(np.diag(JJ))
+                update = np.linalg.solve(JJ_damped, rhs)
+                solved = True
+            except Exception as e:
+                warnings.warn(f"Singular matrix occurs: damping_factor={self.damping_factor}")
 
-        #         # Check update criteria
-        #         device_output_map = self._forward(device_input_map)
-        #         new_loss_val = self._compute_loss(device_output_map, device_target_map)
-        #         if new_loss_val < loss_val:
-        #             loss_val = new_loss_val
-        #             # Success in updating, then damp down and save the model
-        #             self.damping_factor = max(self.damping_factor * 0.1, 1e-9)
-        #             self._save_parameters()
-        #             break
-        #         else:
-        #             warnings.warn("Failed attempt due to increasing loss")
-        #             self._restore_parameters()
+            # Success in solving update
+            if solved:
+                # Update
+                self._update_parameters(update)
+                # Check update criteria
+                device_output_map = self._forward(device_input_map)
+                new_loss_val = self._compute_loss(device_output_map, device_target_map)
+                if new_loss_val < loss_val:
+                    # Success in updating
+                    loss_val = new_loss_val
+                    self.damping_factor = max(self.damping_factor * self.damping_down, self.damping_min)
+                    self._save_parameters()
+                    break
+                else:
+                    # Fail in updating
+                    warnings.warn('Failed attempt due to increasing loss')
+                    self._restore_parameters()
+            
+            # Fail in damping
+            self.damping_factor = self.damping_factor * self.damping_up
+            # Check termination criteria
+            if self.damping_factor >= self.damping_max:
+                warnings.warn("Terminated due to large damping factor")
+                self.damping_factor = self.damping_start
+                break
 
-        #     # Fail in updating, damp up
-        #     self.damping_factor *= 10.0
-
-        #     # Check termination criteria
-        #     terminating = self.damping_factor >= 1e9
-        #     if terminating:
-        #         # Warn and reset damping factor
-        #         warnings.warn("Terminated due to large damping factor")
-        #         self.damping_factor = 1e-3
-        #         break
-
-        # return loss_val, terminating
+        return loss_val, terminating
 
 
     @torch.no_grad()
@@ -205,8 +201,15 @@ class LeMA:
         for device, backup in self.device_flat_params_backup_map.items():
             self.device_flat_params_map[device].copy_(backup)
 
-    # @torch.no_grad()
-    # def _update_parameters(self, updates_legate):
-        # for device, p in self.device_flat_params_map.items():
-            # p.add_(-device_update_map[device])
+    @torch.no_grad()
+    def _update_parameters(self, update):
+        # rt = lg.get_legate_runtime()
+        device_update_map = {device : torch.empty(self.params_size, device=device) for device in self.devices} # TODO: specify dtype
+        # rt.issue_execution_fence()
+        broadcast_to_torch(update, device_update_map)
+        # rt.issue_execution_fence()
+        # time()
+
+        for device, p in self.device_flat_params_map.items():
+            p.add_(-device_update_map[device])
 

@@ -35,6 +35,6 @@ for device in devices:
     torch.cuda.synchronize(device)
 
 # Test multiple steps
-for _ in range(1):
-    lema_optim.step(x, y)
-    print()
+for _ in range(5):
+    loss, terminating = lema_optim.step(x, y)
+    print(loss)
