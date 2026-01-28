@@ -16,18 +16,28 @@ Parameters:
 def gather_to_cupynumeric(src_ranges: List[Tuple[int, int]], src_slices: List[torch.Tensor], dest: np.ndarray):
     @task(variants=(VariantCode.GPU,))
     def gather_task(ctx: TaskContext, dest_slice: OutputArray):
-        # Determine the destination slice
         lo_row, lo_col = dest_slice.domain().lo
         hi_row, hi_col = dest_slice.domain().hi
-        hi_row, hi_col = hi_row + 1, hi_col + 1
-        assert lo_row == 0 # Assume the cupynumeric array does not split the row direction
+        hi_row, hi_col = hi_row + 1, hi_col + 1 
 
         dest_slice = cupy.asarray(dest_slice)
 
-        # Copy loop
         for (src_begin, src_end), src_slice in zip(src_ranges, src_slices):
-            src_slice = cupy.asarray(src_slice)
-            dest_slice[src_begin:src_end, :] = src_slice[:, lo_col:hi_col]
+            intersect_start = max(lo_row, src_begin)
+            intersect_end = min(hi_row, src_end)
+
+            if intersect_start >= intersect_end:
+                continue
+
+            dst_local_start = intersect_start - lo_row
+            dst_local_end = intersect_end - lo_row
+
+            src_local_start = intersect_start - src_begin
+            src_local_end = intersect_end - src_begin
+            src_slice_gpu = cupy.asarray(src_slice)
+            
+            dest_slice[dst_local_start:dst_local_end, :] = \
+                src_slice_gpu[src_local_start:src_local_end, lo_col:hi_col]
 
     gather_task(dest)
 
@@ -57,6 +67,7 @@ Parameters:
     src - cuPyNumeric array to be sent.
     device_tensor_map - Mapping CUDA device to output torch tensor.
 '''
+# TODO: fix sync issue
 def broadcast_to_torch(src: np.ndarray, device_tensor_map: Dict[torch.device, torch.Tensor]):
     @task(variants=(VariantCode.GPU,))
     def broadcast_task(ctx: TaskContext, src_slice: InputArray):
@@ -66,10 +77,13 @@ def broadcast_to_torch(src: np.ndarray, device_tensor_map: Dict[torch.device, to
         src_slice = cupy.asarray(src_slice)
         for device, dest_slice in device_tensor_map.items():
             dest_slice[lo:hi] = torch.as_tensor(src_slice[:], device=device)
-            # TODO: fix this weird issue
-            # print(f"{lo}:{hi}: {dest_slice[lo:hi].sum().item()} {src_slice[:].sum().item()}")
     
     broadcast_task(src)
-    # for device, x in device_tensor_map.items():
-        # print(device, x)
-    # print()
+
+'''
+Broadcast a cuPyNumeric array to torch via CPU.
+'''
+def broadcast_to_torch_cpu(src: np.ndarray, device_tensor_map: Dict[torch.device, torch.Tensor]):
+    host_src = torch.tensor(src, device='cpu', pin_memory=True)
+    for device, dest in device_tensor_map.items():
+        dest[:] = host_src

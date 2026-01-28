@@ -1,0 +1,1 @@
+legate --gpus 2 train.py --epochs 10

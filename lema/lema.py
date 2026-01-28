@@ -3,11 +3,10 @@ import legate
 import legate.core as lg
 import torch
 import warnings
-import legate.core as lg
 from .replicate import replicate_tensor, replicate_model
 from .utils import unflatten_params, ceil_div
 from .constant import DEFAULT_SLICE_PER_DEVICE
-from .comm import gather_to_cupynumeric, send_to_cupynumeric, broadcast_to_torch
+from .comm import gather_to_cupynumeric, send_to_cupynumeric, broadcast_to_torch, broadcast_to_torch_cpu
 from legate.timing import time
 
 def _query_numpy_type(type_str):
@@ -203,13 +202,8 @@ class LeMA:
 
     @torch.no_grad()
     def _update_parameters(self, update):
-        # rt = lg.get_legate_runtime()
         device_update_map = {device : torch.empty(self.params_size, device=device) for device in self.devices} # TODO: specify dtype
-        # rt.issue_execution_fence()
-        broadcast_to_torch(update, device_update_map)
-        # rt.issue_execution_fence()
-        # time()
+        broadcast_to_torch_cpu(update, device_update_map)
 
         for device, p in self.device_flat_params_map.items():
             p.add_(-device_update_map[device])
-
