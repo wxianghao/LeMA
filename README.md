@@ -1,15 +1,16 @@
-# LeMA: Multi-GPU Levenberg-Marquardt Optimizer Powered by NVIDIA cuPyNumeric and Legate
+# LeMA: Multi-GPU Levenberg-Marquardt Optimizer Powered by NVIDIA cuPyNumeric
 
 ## Get Started
 
-### Install dependencies
+### Install
 ```bash
-# cuPyNumeric, Legate
-CONDA_OVERRIDE_CUDA="12.2" \
-  conda install -c conda-forge -c legate cupynumeric
+pip install -e . # Option 1: Install from source
+pip install lema # Option 2: Install from pip
 ```
-### Build LeMA
+
+### Build
+We uses [uv](https://github.com/astral-sh/uv) to manage our project's dependencies. To build LeMA:
 ```bash
-  pip install -e .
+uv build
 ```
 
