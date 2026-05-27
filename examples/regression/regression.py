@@ -8,23 +8,15 @@ from torch.utils.data import TensorDataset, DataLoader
 class SimpleDense(nn.Module):
     def __init__(self):
         super().__init__()
-        self.linear_tanh_stack = nn.Sequential(
-            nn.Linear(1, 128), nn.Tanh(), nn.Linear(128, 1)
-        )
+        self.linear_tanh_stack = nn.Sequential(nn.Linear(1, 128), nn.Tanh(), nn.Linear(128, 1))
 
     def forward(self, x):
         return self.linear_tanh_stack(x)
 
 
 def main():
-    # Init process
-    rank, nrank = LeMA.begin_distribution()
-    print(f"Init Rank {rank}")
-
     # Prepare dataset
-    x = torch.linspace(
-        -1.0, 1.0, 100000, dtype=torch.float32, pin_memory=True
-    ).unsqueeze(1)
+    x = torch.linspace(-1.0, 1.0, 100000, dtype=torch.float32, pin_memory=True).unsqueeze(1)
     y = torch.sinc(x)
     dataset = TensorDataset(x, y)
     loader = DataLoader(dataset, batch_size=128, shuffle=True, pin_memory=True)
@@ -40,9 +32,7 @@ def main():
             y = y.to(torch.device("cuda"))
             lema_optim.step(x, y)
             break
-
-    # Free process
-    LeMA.end_distribution()
+        break
 
 
 if __name__ == "__main__":
