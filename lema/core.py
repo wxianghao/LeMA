@@ -21,25 +21,38 @@ class LeMA:
         residual_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         model_dtype: torch.dtype | None = None,
         optim_dtype: np.dtype = np.float32,
+        max_iters: int = 10,
+        damp_start: float = 1e-3,
+        damp_ratio: float = 10.0,
+        damp_min: float = 1e-9,
+        damp_max: float = 1e9,
     ) -> None:
         # Annotate members' types
         self._model: nn.Module
         self._flat: torch.Tensor
         self._backup: torch.Tensor
+        self._device: torch.device
         self._residual_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float]
+        # self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float]
         self._optim_dtype: np.dtype
+        self._max_iters: int
+        self._damp_start: float
+        self._damp_ratio: float
+        self._damp_min: float
+        self._damp_max: float
+        self._damp_cur: float
         self._rank: int
         self._world_size: int
 
         # Setup process info
         rt = get_legate_runtime()
-        self._rank: int = rt.node_id
-        self._world_size: int = rt.node_count
+        self._rank = rt.node_id
+        self._world_size = rt.node_count
+        self._device = next(model.parameters()).device
 
         # Setup the residual and the loss functions
         self._residual_fn = lambda y_hat, y: torch.flatten(residual_callable(y_hat, y))
-        self._loss_fn = lambda y_hat, y: float(self._residual_fn(y_hat, y).square().mean())
+        # self._loss_fn = lambda y_hat, y: float(self._residual_fn(y_hat, y).square().mean())
 
         # Setup and flatten the model
         self._model = model
@@ -57,93 +70,70 @@ class LeMA:
         # Backup the flat parameter tensor
         self._backup = self._flat.clone()
 
-        # Determine the optimizer's data type
+        # Configure the optimizer options
         self._optim_dtype = optim_dtype
+        self._max_iters = max_iters
+        self._damp_start = damp_start
+        self._damp_ratio = damp_ratio
+        self._damp_min = damp_min
+        self._damp_max = damp_max
+        self._damp_cur = damp_start
 
     @torch.no_grad()
     def step(self, x: torch.Tensor, y: torch.Tensor, slice_size: int = 64):
-        # Initialize Jacobian matrix
         batch_size, model_size = x.shape[0], self._flat.shape[0]
+
+        # Split the input
+        samples_per_rank = (batch_size + self._world_size - 1) // self._world_size
+        rank_start_idx = self._rank * samples_per_rank
+        rank_end_idx = min(batch_size, rank_start_idx + samples_per_rank)
+        x_slice = x[rank_start_idx:rank_end_idx]
+        y_slice = y[rank_start_idx:rank_end_idx]
+
+        # Compute the Jacobian matrix
         J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
+        for offset in range(rank_start_idx, rank_end_idx, slice_size):
+            cnt = min(slice_size, rank_end_idx - offset)
+            J_slice = self._compute_jacobian_slice(x[offset : offset + cnt], y[offset : offset + cnt])
+            J[offset : offset + cnt, :] = np.asarray(J_slice)
 
-        def handle_slice(x_slice: torch.Tensor, y_slice: torch.Tensor, offset: int, cnt: int):
-            # Compute Jacobian slice
-            J_slice = self._compute_jacobian_slice(x_slice, y_slice)
+        # Compute the residual
+        r = np.empty(batch_size, dtype=self._optim_dtype)
+        r_slice = np.array(self._residual_fn(self._model(x_slice), y_slice))
+        r[rank_start_idx:rank_end_idx] = r_slice
 
-            # Gather Jacobian slice
-            # J[offset:offset+cnt, :] = J_slice
-            @task(
-                variants=(VariantCode.GPU,),
-                options=VariantOptions(concurrent=True),
-            )
-            def gather_slice(ctx: TaskContext, dst_store: OutputStore) -> None:
-                t_dst = torch.from_dlpack(dst_store)
-                t_dst.copy_(J_slice)
-
-            gather_slice(J)
-
-        # Handle slices in a round-robin way
-        offset, cur_rank = 0, 0
-        while offset < batch_size:
-            if self._rank == cur_rank:
-                end = min(batch_size, offset + slice_size)
-                handle_slice(x[offset:end], y[offset:end], offset, end - offset)
-            cur_rank = (cur_rank + 1) % self._world_size
-            offset += slice_size
-
-        # # Split the input
-        # samples_per_rank = (x.shape[0] + self._world_size - 1) // self._world_size
-        # rank_start_idx = self._rank * samples_per_rank
-        # rank_end_idx = min(x.shape[0], rank_start_idx + samples_per_rank)
-        # x = x[rank_start_idx:rank_end_idx]
-        # y = y[rank_start_idx:rank_end_idx]
-
-        # # Determine the Jacobian's shape
-        # batch_size = y.shape[0]
-        # model_size = self._flat.shape[0]
-
-        # # Calculate the output and the residual
-        # y_hat = self._model(y)
-        # r = self._residual_fn(y_hat, y)
-
-        # # Compute the Jacobian matrix
-        # J = self._compute_jacobian(x, y, slice_size=slice_size)
-
-        # # Build equation
-        # overdetermined = batch_size > model_size
-        # if overdetermined:
-        #     pass
+        # # Build the LM equation
+        # transformed = batch_size < model_size
+        # if transformed:
+        #     JJ = J @ J.T
+        #     rhs = r
         # else:
-        #     pass
+        #     JJ = J.T @ J
+        #     rhs = J.T @ J
 
-    # @torch.no_grad()
-    # def _compute_jacobian(self, x: torch.Tensor, y: torch.Tensor, slice_size: int = 0) -> np.ndarray:
-    #     # Determine the Jacobian size
-    #     nsamples, nparams = x.shape[0], self._flat.shape[0]
-    #     J = np.empty((nsamples, nparams), dtype=self._optim_dtype)
+        # terminating = False
+        # loss = np.mean(np.square(r))
+        # print(loss)
+        # for i in range(self._max_iters):
+        #     solved = False
+        #     JJ_damped = JJ + self._damp_cur * np.eye(JJ.shape[0])
+        #     try:
+        #         delta = np.linalg.solve(JJ_damped, rhs)
+        #         solved = True
+        #     except Exception as e:
+        #         pass
 
-    #     # Determine the slice size
-    #     slice_size = slice_size if slice_size > 0 else x.shape[0]
+        #     if transformed:
+        #         delta = J.T @ delta
 
-    #     # Compute the Jacobian matrix slice by slice
-    #     slice_start_idx = 0
-    #     while slice_start_idx < slice_size:
-    #         slice_end_idx = min(x.shape[0], slice_start_idx + slice_size)
-    #         xx = x[slice_start_idx:slice_end_idx]
-    #         yy = y[slice_start_idx:slice_end_idx]
-
-    #         # Compute slice
-    #         J_slice = self._compute_jacobian_slice(xx, yy)
-
-    #         # Send slice
-    #         @task(
-    #             variants=(VariantCode.GPU,),
-    #             options=VariantOptions(concurrent=True),
-    #         )
-    #         def gather_to_legate(ctx: TaskContext, dst_store: OutputStore) -> None:
-    #             pass
-
-    #         slice_start_idx = slice_end_idx
+        #     if solved:
+        #         # Update
+        #         self._flat.add_(torch.from_dlpack(delta, device=self._device))
+        #         # Calculate the new loss
+        #         r_slice_new = np.array(self._residual_fn(self._model(x_slice), y_slice))
+        #         r[rank_start_idx:rank_end_idx] = r_slice_new
+        #         new_loss = np.mean(np.square(r))
+        #         print(new_loss)
 
     @torch.no_grad()
     def _compute_jacobian_slice(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -159,5 +149,6 @@ class LeMA:
 
         # Determine the Jacobian's evaluation function
         m, n = x.shape[0], self._flat.shape[0]
+        # TODO: jacrev may produce NaN
         jac_fn = torch.func.jacrev if m < n else torch.func.jacfwd
         return jac_fn(lambda p: compute_residual(p, x, y))(self._flat)
