@@ -28,7 +28,7 @@ class LeMA:
         self._backup: torch.Tensor
         self._device: torch.device
         self._residual_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-        # self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float]
+        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float]
         self._optim_dtype: np.dtype
         self._max_iters: int
         self._damp_start: float
@@ -47,7 +47,7 @@ class LeMA:
 
         # Setup the residual and the loss functions
         self._residual_fn = lambda y_hat, y: torch.flatten(residual_callable(y_hat, y))
-        # self._loss_fn = lambda y_hat, y: float(self._residual_fn(y_hat, y).square().mean())
+        self._loss_fn = lambda y_hat, y: float(self._residual_fn(y_hat, y).square().mean())
 
         # Setup and flatten the model
         self._model = model
@@ -69,7 +69,7 @@ class LeMA:
         self._optim_dtype = optim_dtype
         self._max_iters = max_iters
         self._damp_start = damp_start
-        self._damp_ratio = damp_ratio
+        self._damp_ratio = damp_ratio if damp_ratio >= 1.0 else 1.0 / damp_ratio
         self._damp_min = damp_min
         self._damp_max = damp_max
         self._damp_cur = damp_start
@@ -82,8 +82,6 @@ class LeMA:
         samples_per_rank = (batch_size + self._world_size - 1) // self._world_size
         rank_start_idx = self._rank * samples_per_rank
         rank_end_idx = min(batch_size, rank_start_idx + samples_per_rank)
-        x_slice = x[rank_start_idx:rank_end_idx]
-        y_slice = y[rank_start_idx:rank_end_idx]
 
         # Compute the Jacobian matrix
         J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
@@ -93,10 +91,74 @@ class LeMA:
             gather_interop_2d_row(J_slice, J, start - rank_start_idx, end - rank_start_idx)
 
         # Compute the residual
-        r = np.empty(batch_size, dtype=self._optim_dtype)
-        r_slice = self._residual_fn(self._model(x_slice), y_slice)
-        r[rank_start_idx:rank_end_idx] = r_slice
-        gather_interop_1d(r_slice, r, 0, rank_end_idx - rank_start_idx)
+        t_r = self._residual_fn(self._model(x), y)
+        r = np.array(t_r, dtype=self._optim_dtype)
+
+        # Build the LMA equation
+        JJ, rhs = self._build_equation(J, r)
+
+        # LMA iteration
+        terminate = False
+        loss_val = self._loss_fn(self._model(x), y)
+        for i in range(self._max_iters):
+            lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
+            delta = self._solve_equation(J, lhs, rhs)
+
+            if delta is not None:
+                # Update
+                # TODO: possibily involving device-host communication
+                t_delta = torch.from_dlpack(delta, device=self._flat.device)
+                self._flat.add_(t_delta)
+
+                # Check update criertia
+                new_loss_val = self._loss_fn(self._model(x), y)
+                if new_loss_val > loss_val:
+                    # Succeed in updating
+                    loss_val = new_loss_val
+                    self._damp_cur = max(self._damp_cur * self._damp_ratio, self._damp_max)
+                    self._save_parameters()
+                    break
+
+                # Fail in updating
+                self._restore_parameters()
+
+            # Fail in damping
+            self._damp_cur = min(self._damp_cur / self._damp_ratio, self._damp_min)
+
+            # Check termination criteria
+            if self._damp_cur >= self._damp_max:
+                self._damp_cur = self._damp_start
+                break
+
+        return terminate
+
+    def _build_equation(self, J: np.ndarray, r: np.ndarray) -> np.ndarray:
+        batch_size, model_size = J.shape
+        if model_size > batch_size:
+            JJ = J @ J.T
+            rhs = r
+        else:
+            JJ = J.T @ J
+            rhs = J.T @ r
+        return JJ, rhs
+
+    def _solve_equation(self, J: np.ndarray, lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray | None:
+        batch_size, model_size = J.shape
+        try:
+            delta = np.linalg.solve(lhs, rhs)
+        except Exception as e:
+            return None
+        if model_size > batch_size:
+            delta = J.T @ delta
+        return delta
+
+    @torch.no_grad()
+    def _save_parameters(self):
+        self._backup.copy_(self._flat)
+
+    @torch.no_grad()
+    def _restore_parameters(self):
+        self._flat.copy_(self._backup)
 
     @torch.no_grad()
     def _compute_jacobian_slice(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

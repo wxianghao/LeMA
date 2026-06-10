@@ -2,7 +2,7 @@ import cupynumeric as np
 import torch
 
 from legate.core import TaskContext, VariantCode, VariantOptions, get_legate_runtime, broadcast
-from legate.core.task import task, OutputStore
+from legate.core.task import task, OutputStore, InputStore
 
 
 def gather_interop_1d(src: torch.Tensor, dst: np.ndarray, local_start: int, local_end: int) -> None:
