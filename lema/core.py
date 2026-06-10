@@ -5,13 +5,8 @@ import os
 
 from typing import Tuple, Callable
 from torch import nn
-from legate.core import (
-    TaskContext,
-    VariantCode,
-    VariantOptions,
-    get_legate_runtime,
-)
-from legate.core.task import task, OutputStore
+from .interop import gather_interop_1d, gather_interop_2d_row
+from legate.core import get_legate_runtime
 
 
 class LeMA:
@@ -92,48 +87,16 @@ class LeMA:
 
         # Compute the Jacobian matrix
         J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
-        for offset in range(rank_start_idx, rank_end_idx, slice_size):
-            cnt = min(slice_size, rank_end_idx - offset)
-            J_slice = self._compute_jacobian_slice(x[offset : offset + cnt], y[offset : offset + cnt])
-            J[offset : offset + cnt, :] = np.asarray(J_slice)
+        for start in range(rank_start_idx, rank_end_idx, slice_size):
+            end = min(start + slice_size, rank_end_idx)
+            J_slice = self._compute_jacobian_slice(x[start:end], y[start:end])
+            gather_interop_2d_row(J_slice, J, start - rank_start_idx, end - rank_start_idx)
 
         # Compute the residual
         r = np.empty(batch_size, dtype=self._optim_dtype)
-        r_slice = np.array(self._residual_fn(self._model(x_slice), y_slice))
+        r_slice = self._residual_fn(self._model(x_slice), y_slice)
         r[rank_start_idx:rank_end_idx] = r_slice
-
-        # # Build the LM equation
-        # transformed = batch_size < model_size
-        # if transformed:
-        #     JJ = J @ J.T
-        #     rhs = r
-        # else:
-        #     JJ = J.T @ J
-        #     rhs = J.T @ J
-
-        # terminating = False
-        # loss = np.mean(np.square(r))
-        # print(loss)
-        # for i in range(self._max_iters):
-        #     solved = False
-        #     JJ_damped = JJ + self._damp_cur * np.eye(JJ.shape[0])
-        #     try:
-        #         delta = np.linalg.solve(JJ_damped, rhs)
-        #         solved = True
-        #     except Exception as e:
-        #         pass
-
-        #     if transformed:
-        #         delta = J.T @ delta
-
-        #     if solved:
-        #         # Update
-        #         self._flat.add_(torch.from_dlpack(delta, device=self._device))
-        #         # Calculate the new loss
-        #         r_slice_new = np.array(self._residual_fn(self._model(x_slice), y_slice))
-        #         r[rank_start_idx:rank_end_idx] = r_slice_new
-        #         new_loss = np.mean(np.square(r))
-        #         print(new_loss)
+        gather_interop_1d(r_slice, r, 0, rank_end_idx - rank_start_idx)
 
     @torch.no_grad()
     def _compute_jacobian_slice(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
