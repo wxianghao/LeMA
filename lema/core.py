@@ -130,7 +130,8 @@ class LeMA:
                 self._damp_cur = self._damp_start
                 break
 
-        return terminate
+        # TODO: Add more iteration information
+        return terminate, {"loss": loss_val, "damp": self._damp_cur}
 
     def _build_equation(self, J: np.ndarray, r: np.ndarray) -> np.ndarray:
         batch_size, model_size = J.shape
