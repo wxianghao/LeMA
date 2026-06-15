@@ -1,9 +1,8 @@
 import cupynumeric as np
 import torch
-from torch.nn.utils import parameters_to_vector
-import nvtx
 
-from typing import Tuple, Callable
+from torch.nn.utils import parameters_to_vector
+from typing import Callable
 from torch import nn
 from .interop import gather_interop_1d, gather_interop_2d_row
 from legate.core import get_legate_runtime
@@ -84,57 +83,53 @@ class LeMA:
         rank_end_idx = min(batch_size, rank_start_idx + samples_per_rank)
 
         # Compute the Jacobian matrix
-        with nvtx.annotate('Compute Jacobian Matrix'):
-            J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
-            for start in range(rank_start_idx, rank_end_idx, slice_size):
-                end = min(start + slice_size, rank_end_idx)
-                J_slice = self._compute_jacobian_slice(x[start:end], y[start:end])
-                gather_interop_2d_row(J_slice, J, start - rank_start_idx, end - rank_start_idx)
-    
+        J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
+        for start in range(rank_start_idx, rank_end_idx, slice_size):
+            end = min(start + slice_size, rank_end_idx)
+            J_slice = self._compute_jacobian_slice(x[start:end], y[start:end])
+            gather_interop_2d_row(J_slice, J, start - rank_start_idx, end - rank_start_idx)
 
         # Compute the residual
-        # t_r = self._residual_fn(self._model(x), y)
-        # r = np.array(t_r, dtype=self._optim_dtype)
+        t_r = self._residual_fn(self._model(x), y)
+        r = np.array(t_r, dtype=self._optim_dtype)
 
 
         # Build the LMA equation
-        # JJ, rhs = self._build_equation(J, r)
+        JJ, rhs = self._build_equation(J, r)
 
-        # # LMA iteration
-        # terminate = False
-        # loss_val = self._loss_fn(self._model(x), y)
-        # for i in range(self._max_iters):
-        #     lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
-        #     delta = self._solve_equation(J, lhs, rhs)
+        # LMA iteration
+        terminate = False
+        loss_val = self._loss_fn(self._model(x), y)
+        for i in range(self._max_iters):
+            lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
+            delta = self._solve_equation(J, lhs, rhs)
 
-        #     if delta is not None:
-        #         # Update
-        #         # TODO: possibily involving device-host communication
-        #         t_delta = torch.from_dlpack(delta, device=self._flat.device)
-        #         self._flat.add_(t_delta)
+            if delta is not None:
+                # Update
+                t_delta = torch.from_dlpack(delta, device=self._flat.device)
+                self._flat.add_(t_delta)
 
-        #         # Check update criertia
-        #         new_loss_val = self._loss_fn(self._model(x), y)
-        #         if new_loss_val > loss_val:
-        #             # Succeed in updating
-        #             loss_val = new_loss_val
-        #             self._damp_cur = max(self._damp_cur * self._damp_ratio, self._damp_max)
-        #             self._save_parameters()
-        #             break
+                # Check update criertia
+                new_loss_val = self._loss_fn(self._model(x), y)
+                if new_loss_val > loss_val:
+                    # Succeed in updating
+                    loss_val = new_loss_val
+                    self._damp_cur = max(self._damp_cur * self._damp_ratio, self._damp_max)
+                    self._save_parameters()
+                    break
 
-        #         # Fail in updating
-        #         self._restore_parameters()
+                # Fail in updating
+                self._restore_parameters()
 
-        #     # Fail in damping
-        #     self._damp_cur = min(self._damp_cur / self._damp_ratio, self._damp_min)
+            # Fail in damping
+            self._damp_cur = min(self._damp_cur / self._damp_ratio, self._damp_min)
 
-        #     # Check termination criteria
-        #     if self._damp_cur >= self._damp_max:
-        #         self._damp_cur = self._damp_start
-        #         break
+            # Check termination criteria
+            if self._damp_cur >= self._damp_max:
+                self._damp_cur = self._damp_start
+                break
 
-        # # TODO: Add more iteration information
-        # return terminate, {"loss": loss_val, "damp": self._damp_cur}
+        return terminate, {"loss": loss_val, "damp": self._damp_cur}
 
     def _build_equation(self, J: np.ndarray, r: np.ndarray) -> np.ndarray:
         batch_size, model_size = J.shape
