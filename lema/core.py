@@ -93,7 +93,6 @@ class LeMA:
         t_r = self._residual_fn(self._model(x), y)
         r = np.array(t_r, dtype=self._optim_dtype)
 
-
         # Build the LMA equation
         JJ, rhs = self._build_equation(J, r)
 
@@ -169,7 +168,7 @@ class LeMA:
                 for (name, param), tensor in zip(dict(self._model.named_parameters()).items(), params_list)
             }
             yy_hat = torch.func.functional_call(self._model, params, xx)
-            return self._residual_fn(yy, yy_hat)
+            return self._residual_fn(yy_hat, yy)
 
         # Determine the Jacobian's evaluation function
         m, n = x.shape[0], self._flat.shape[0]
