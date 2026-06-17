@@ -138,7 +138,7 @@ class LeMA:
                 if new_loss < loss:
                     # Succeed in updating
                     loss = new_loss
-                    self._damp_cur = max(self._damp_cur * self._damp_ratio, self._damp_max)
+                    self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
                     self._save_parameters()
                     break
 
@@ -146,7 +146,7 @@ class LeMA:
                 self._restore_parameters()
 
             # Fail in damping
-            self._damp_cur = min(self._damp_cur / self._damp_ratio, self._damp_min)
+            self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
 
             # Check termination criteria
             if self._damp_cur >= self._damp_max:
