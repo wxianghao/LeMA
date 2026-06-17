@@ -169,12 +169,6 @@ def main():
     model = Net().to(device)
     optim = LeMA(model, residual_fn)
 
-    # Print basic information
-    if rank == 0:
-        print(f"Number of processes: {world_size}")
-        print(f"Batch size: {args.batch_size}")
-        print(f"Slice size: {args.slice_size}")
-
     # Train
     for epoch in range(1, args.epochs):
         trainsampler.set_epoch(epoch=epoch - 1)
