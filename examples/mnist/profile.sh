@@ -1,0 +1,1 @@
+nsys profile -t cuda bash examples/mnist/train.sh

@@ -2,10 +2,14 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import torch.nn.functional as F
-from legate.core import get_legate_runtime
 import argparse
-from torch import nn
+import torch.distributed as dist
+
+
 from lema import LeMA
+from legate.core import get_legate_runtime
+from torch import nn
+from torch.utils.data.distributed import DistributedSampler
 
 
 ################################################################################
@@ -44,67 +48,69 @@ def load_dataset(args):
     root_path = ".data"
 
     train_kwargs = {"batch_size": args.batch_size}
-    test_kwargs = {"batch_size": args.test_batch_size}
-    accel_kwargs = {"num_workers": 1, "persistent_workers": True, "pin_memory": True, "shuffle": True}
+    # test_kwargs = {"batch_size": args.test_batch_size}
+    accel_kwargs = {"num_workers": 1, "persistent_workers": True, "pin_memory": True}
     train_kwargs.update(accel_kwargs)
-    test_kwargs.update(accel_kwargs)
+    # test_kwargs.update(accel_kwargs)
 
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
     trainset = torchvision.datasets.MNIST(root_path, train=True, download=False, transform=transform)
-    testset = torchvision.datasets.MNIST(root_path, train=False, transform=transform)
-    trainloader = torch.utils.data.DataLoader(trainset, **train_kwargs)
-    testloader = torch.utils.data.DataLoader(testset, **test_kwargs)
-    return trainloader, testloader
+    trainsampler = DistributedSampler(trainset)
+    # testset = torchvision.datasets.MNIST(root_path, train=False, transform=transform)
+    trainloader = torch.utils.data.DataLoader(trainset, sampler=trainsampler, **train_kwargs)
+    # testloader = torch.utils.data.DataLoader(testset, **test_kwargs)
+    # return trainloader, testloader
+    return (trainloader, trainsampler)
 
 
 ################################################################################
 # Residual function
 ################################################################################
 def residual_fn(a, b):
-    return torch.sqrt(torch.nn.functional.cross_entropy(a, b, reduction="none"))
+    return torch.sqrt(F.nll_loss(a, b, reduction="none"))
 
 
 ################################################################################
 # Train function for one epoch
 ################################################################################
-def train(args, rank, model, device, train_loader, optimizer, epoch):
-    for batch_idx, (data, target) in enumerate(train_loader):
+def train(args, rank, model, device, dataloader, optimizer, epoch):
+    for batch_idx, (data, target) in enumerate(dataloader):
         data, target = data.to(device), target.to(device)
-        output = model(data)
-        loss = F.nll_loss(output, target)
+        terminate, res = optimizer.step(data, target, args.slice_size)
+        loss = res["loss"]
+
         if rank == 0 and batch_idx % args.log_interval == 0:
             print(
                 "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
                     epoch,
-                    batch_idx * len(data),
-                    len(train_loader.dataset),
-                    100.0 * batch_idx / len(train_loader),
-                    loss.item(),
+                    (batch_idx + 1) * len(data),
+                    len(dataloader.dataset),
+                    100.0 * (batch_idx + 1) / len(dataloader),
+                    loss,
                 )
             )
-        optimizer.step(data, target, args.slice_size)
 
 
 ################################################################################
 # Test function
 ################################################################################
-def test(model, device, test_loader):
-    model.eval()
-    test_loss = 0.0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += F.nll_loss(output, target, reduction="sum").item()  # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    test_loss /= len(test_loader.dataset)
-    print(
-        "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-            test_loss, correct, len(test_loader.dataset), 100.0 * correct / len(test_loader.dataset)
-        )
-    )
+# def test(model, device, test_loader):
+#     model.eval()
+#     test_loss = 0.0
+#     correct = 0
+#     with torch.no_grad():
+#         for data, target in test_loader:
+#             data, target = data.to(device), target.to(device)
+#             output = model(data)
+#             test_loss += F.nll_loss(output, target, reduction="sum").item()  # sum up batch loss
+#             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+#             correct += pred.eq(target.view_as(pred)).sum().item()
+#     test_loss /= len(test_loader.dataset)
+#     print(
+#         "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
+#             test_loss, correct, len(test_loader.dataset), 100.0 * correct / len(test_loader.dataset)
+#         )
+#     )
 
 
 ################################################################################
@@ -123,9 +129,9 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=1024,
         metavar="N",
-        help="input batch size for training (default: 64)",
+        help="input batch size for training (default: 1024)",
     )
     parser.add_argument(
         "--test-batch-size",
@@ -154,8 +160,11 @@ def main():
     rank = get_legate_runtime().node_id
     world_size = get_legate_runtime().node_count
 
+    # Initialize process
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="tcp://127.0.0.1:1234")
+
     # Prepare dataset, model and optimizer
-    trainloader, testloader = load_dataset(args)
+    trainloader, trainsampler = load_dataset(args)
     device = torch.device("cuda")
     model = Net().to(device)
     optim = LeMA(model, residual_fn)
@@ -168,8 +177,11 @@ def main():
 
     # Train
     for epoch in range(1, args.epochs):
+        trainsampler.set_epoch(epoch=epoch - 1)
         train(args, rank, model, device, trainloader, optim, epoch)
-        test(model, device, testloader)
+        # test(model, device, testloader)
+
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
