@@ -133,7 +133,7 @@ class LeMA:
             if delta is not None:
                 # Update
                 t_delta = torch.from_dlpack(delta, device=self._flat.device)
-                self._flat.add_(t_delta)
+                self._flat.sub_(t_delta)
 
                 # Check update criertia
                 new_loss = self._compute_loss(x, y)
