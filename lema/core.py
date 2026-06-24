@@ -125,6 +125,8 @@ class LeMA:
         # LMA iteration
         ################################################################################
         terminate = False
+        damp_down_cnt = 0
+        damp_up_cnt = 0
         for i in range(self._max_iters):
             lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
             delta = self._solve_equation(J, lhs, rhs)
@@ -138,7 +140,8 @@ class LeMA:
                 if new_loss < loss:
                     # Succeed in updating
                     loss = new_loss
-                    self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
+                    self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
+                    damp_down_cnt += 1
                     self._save_parameters()
                     break
 
@@ -146,14 +149,23 @@ class LeMA:
                 self._restore_parameters()
 
             # Fail in damping
-            self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
+            self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
+            damp_up_cnt += 1
 
             # Check termination criteria
             if self._damp_cur >= self._damp_max:
                 self._damp_cur = self._damp_start
+                terminate = True
                 break
 
-        return terminate, {"loss": loss, "damp": self._damp_cur}
+        return {
+            "terminate": terminate,
+            "loss": loss,
+            "iter": i,
+            "damp": self._damp_cur,
+            "damp_up": damp_up_cnt,
+            "damp_down": damp_down_cnt,
+        }
 
     def _build_equation(self, J: np.ndarray, r: np.ndarray) -> np.ndarray:
         batch_size, model_size = J.shape
