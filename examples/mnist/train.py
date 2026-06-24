@@ -10,6 +10,15 @@ from lema import LeMA
 from legate.core import get_legate_runtime
 from torch import nn
 from torch.utils.data.distributed import DistributedSampler
+from loguru import logger
+
+""" Default values of Command-line arguments
+"""
+EPOCHS = 15
+TOTAL_SIZE = 60_000
+BATCH_SIZE = 256
+TEST_BATCH_SIZE = 256
+SLICE_SIZE = 32
 
 
 ################################################################################
@@ -48,19 +57,18 @@ def load_dataset(args):
     root_path = ".data"
 
     train_kwargs = {"batch_size": args.batch_size}
-    # test_kwargs = {"batch_size": args.test_batch_size}
+    test_kwargs = {"batch_size": args.test_batch_size}
     accel_kwargs = {"num_workers": 1, "persistent_workers": True, "pin_memory": True}
     train_kwargs.update(accel_kwargs)
-    # test_kwargs.update(accel_kwargs)
+    test_kwargs.update(accel_kwargs)
 
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
     trainset = torchvision.datasets.MNIST(root_path, train=True, download=False, transform=transform)
     trainsampler = DistributedSampler(trainset)
-    # testset = torchvision.datasets.MNIST(root_path, train=False, transform=transform)
+    testset = torchvision.datasets.MNIST(root_path, train=False, transform=transform)
     trainloader = torch.utils.data.DataLoader(trainset, sampler=trainsampler, **train_kwargs)
-    # testloader = torch.utils.data.DataLoader(testset, **test_kwargs)
-    # return trainloader, testloader
-    return (trainloader, trainsampler)
+    testloader = torch.utils.data.DataLoader(testset, **test_kwargs)
+    return (trainloader, trainsampler), testloader
 
 
 ################################################################################
@@ -70,111 +78,99 @@ def residual_fn(a, b):
     return torch.sqrt(F.nll_loss(a, b, reduction="none"))
 
 
-################################################################################
-# Train function for one epoch
-################################################################################
-def train(args, rank, model, device, dataloader, optimizer, epoch):
-    for batch_idx, (data, target) in enumerate(dataloader):
-        data, target = data.to(device), target.to(device)
-        terminate, res = optimizer.step(data, target, args.slice_size)
-        loss = res["loss"]
-
-        if rank == 0 and batch_idx % args.log_interval == 0:
-            print(
-                "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-                    epoch,
-                    (batch_idx + 1) * len(data),
-                    len(dataloader.dataset),
-                    100.0 * (batch_idx + 1) / len(dataloader),
-                    loss,
-                )
-            )
-
-
-################################################################################
-# Test function
-################################################################################
-# def test(model, device, test_loader):
-#     model.eval()
-#     test_loss = 0.0
-#     correct = 0
-#     with torch.no_grad():
-#         for data, target in test_loader:
-#             data, target = data.to(device), target.to(device)
-#             output = model(data)
-#             test_loss += F.nll_loss(output, target, reduction="sum").item()  # sum up batch loss
-#             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-#             correct += pred.eq(target.view_as(pred)).sum().item()
-#     test_loss /= len(test_loader.dataset)
-#     print(
-#         "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-#             test_loss, correct, len(test_loader.dataset), 100.0 * correct / len(test_loader.dataset)
-#         )
-#     )
-
-
-################################################################################
-# Main function
-################################################################################
 def main():
-    # Train configuration
+
+    ################################################################################
+    # Parse command-line arguments
+    ################################################################################
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--epochs",
         type=int,
-        default=14,
+        default=EPOCHS,
         metavar="N",
-        help="number of epochs to train (default: 14)",
+        help=f"number of epochs to train (default: {EPOCHS})",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1024,
+        default=BATCH_SIZE,
         metavar="N",
-        help="input batch size for training (default: 1024)",
+        help=f"input batch size for training (default: {BATCH_SIZE})",
     )
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=1000,
+        default=TEST_BATCH_SIZE,
         metavar="N",
-        help="input batch size for testing (default: 1000)",
+        help=f"input batch size for testing (default: {TEST_BATCH_SIZE})",
     )
     parser.add_argument(
         "--slice-size",
         type=int,
-        default=64,
+        default=SLICE_SIZE,
         metavar="N",
-        help="Jacobian row slice size (default: 64)",
+        help=f"Jacobian row slice size (default: {SLICE_SIZE})",
     )
     parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=10,
-        metavar="N",
-        help="how many batches to wait before logging training status",
+        "--log",
+        type=str,
+        default=None,
+        help=f"log file path (default: None)",
     )
     args = parser.parse_args()
 
-    # Get process info
+    ################################################################################
+    # Setup the device and the process
+    ################################################################################
     rank = get_legate_runtime().node_id
     world_size = get_legate_runtime().node_count
-
-    # Initialize process
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="tcp://127.0.0.1:1234")
-
-    # Prepare dataset, model and optimizer
-    trainloader, trainsampler = load_dataset(args)
     device = torch.device("cuda")
+
+    ################################################################################
+    # Setup logging
+    ################################################################################
+    logger.remove()
+    if rank == 0:
+        logger.add(args.log, format="{time:YYYY-MM-DD HH:mm:ss} | {message}", enqueue=True)
+    epoch_width = len(str(args.epochs))
+    batch_width = len(str(TOTAL_SIZE))
+
+    ################################################################################
+    # Prepare the dataset
+    ################################################################################
+    (trainloader, trainsampler), testloader = load_dataset(args)
+
+    ################################################################################
+    # Initialze the model and the optimizer
+    ################################################################################
     model = Net().to(device)
     optim = LeMA(model, residual_fn)
 
+    ################################################################################
     # Train
+    ################################################################################
     for epoch in range(1, args.epochs):
         trainsampler.set_epoch(epoch=epoch - 1)
-        train(args, rank, model, device, trainloader, optim, epoch)
-        # test(model, device, testloader)
+        for batch_idx, (x, y) in enumerate(trainloader):
+            x = x.to(device)
+            y = y.to(device)
+            res = optim.step(x, y, args.slice_size)
+            # Logging
+            if rank == 0:
+                processed = (batch_idx + 1) * world_size * x.shape[0]
+                logger.info(
+                    f"epoch {epoch:{epoch_width}d} | batch {processed:{batch_width}d}/{TOTAL_SIZE:{batch_width}d}  | iterations {res.iterations} | "
+                    f"loss {res.loss:.3e} | damp_factor {res.damp_factor:.3e}",
+                )
+        # Print epoch information
+        if rank == 0:
+            print(f"Train epoch: {epoch:{epoch_width}d}/{args.epochs:{epoch_width}d}\tLoss: {res.loss:.3e}")
 
+    ################################################################################
+    # Destroy the process
+    ################################################################################
     dist.destroy_process_group()
 
 
