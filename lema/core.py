@@ -9,6 +9,13 @@ from .interop import gather_interop_1d, gather_interop_2d_row
 from legate.core import get_legate_runtime
 
 
+class LeMAResults:
+    def __init__(self, iterations: int, loss: float, damp_factor: float) -> None:
+        self.iterations: int = iterations
+        self.loss: float = loss
+        self.damp_factor: float = damp_factor
+
+
 class LeMA:
     def __init__(
         self,
@@ -158,14 +165,11 @@ class LeMA:
                 terminate = True
                 break
 
-        return {
-            "terminate": terminate,
-            "loss": loss,
-            "iter": i,
-            "damp": self._damp_cur,
-            "damp_up": damp_up_cnt,
-            "damp_down": damp_down_cnt,
-        }
+        return LeMAResults(
+            iterations=i,
+            loss=loss,
+            damp_factor=self._damp_cur,
+        )
 
     def _build_equation(self, J: np.ndarray, r: np.ndarray) -> np.ndarray:
         batch_size, model_size = J.shape
