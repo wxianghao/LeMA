@@ -151,7 +151,7 @@ def main():
     ################################################################################
     # Train
     ################################################################################
-    for epoch in range(1, args.epochs):
+    for epoch in range(1, args.epochs + 1):
         trainsampler.set_epoch(epoch=epoch - 1)
         for batch_idx, (x, y) in enumerate(trainloader):
             x = x.to(device)
