@@ -87,7 +87,7 @@ def main():
     # Setup logging
     ################################################################################
     logger.remove()
-    if rank == 0:
+    if rank == 0 and args.log is not None:
         logger.add(args.log, format="{time:YYYY-MM-DD HH:mm:ss} | {message}", enqueue=True)
     epoch_width = len(str(args.epochs))
     batch_width = len(str(args.total_size))
@@ -125,10 +125,10 @@ def main():
             res = optim.step(x, y, args.slice_size)
 
             # Logging
-            if rank == 0:
+            if rank == 0 and args.log is not None:
                 processed = (batch_idx + 1) * world_size * x.shape[0]
                 logger.info(
-                    f"epoch {epoch:{epoch_width}d} | batch {processed:{batch_width}d}/{args.total_size:{batch_width}d}  | iterations {res.iterations} | "
+                    f"epoch {epoch:{epoch_width}d} | batch {processed:{batch_width}d}/{args.total_size:{batch_width}d} | iterations {res.iterations} | "
                     f"loss {res.loss:.3e} | damp_factor {res.damp_factor:.3e}",
                 )
 
