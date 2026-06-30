@@ -1,6 +1,7 @@
 import cupynumeric as np
 import torch
 import torch.distributed as dist
+import torch.cuda.nvtx as nvtx
 
 from torch.nn.utils import parameters_to_vector
 from typing import Callable, Any
@@ -97,36 +98,44 @@ class LeMA:
 
     @torch.no_grad()
     def step(self, x: torch.Tensor, y: torch.Tensor, slice_size: int = 64):
+        nvtx.mark("Start step")
         local_batch_size, model_size = x.shape[0], self._flat.shape[0]
         batch_size = local_batch_size * self._world_size
 
         ################################################################################
         # Compute the Jacobian matrix
         ################################################################################
-        J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
+        with nvtx.range("Init Jacobian"):
+            J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
         # Compute the Jacobian slices
         for start in range(0, local_batch_size, slice_size):
             end = min(start + slice_size, local_batch_size)
-            J_slice = self._compute_jacobian_slice(x[start:end], y[start:end])
+            with nvtx.range("Compute Jacobian slice"):
+                J_slice = self._compute_jacobian_slice(x[start:end], y[start:end])
             # Gather slices
-            gather_interop_2d_row(J_slice, J, start, end)
+            with nvtx.range("Gather Jacobian slice"):
+                gather_interop_2d_row(J_slice, J, start, end)
 
         ################################################################################
         # Compute the residual
         ################################################################################
-        r = np.empty(batch_size, dtype=self._optim_dtype)
-        r_slice = self._residual_fn(self._model(x), y)
-        gather_interop_1d(r_slice, r, 0, local_batch_size)
+        with nvtx.range("Compute residual"):
+            r = np.empty(batch_size, dtype=self._optim_dtype)
+            r_slice = self._residual_fn(self._model(x), y)
+        with nvtx.range("Gather residual"):
+            gather_interop_1d(r_slice, r, 0, local_batch_size)
 
         ################################################################################
         # Build LMA equation
         ################################################################################
-        JJ, rhs = self._build_equation(J, r)
+        with nvtx.range("Build equation"):
+            JJ, rhs = self._build_equation(J, r)
 
         ################################################################################
         # Compute the initial loss
         ################################################################################
-        loss = self._compute_loss(x, y)
+        with nvtx.range("Compute loss initial"):
+            loss = self._compute_loss(x, y)
 
         ################################################################################
         # LMA iteration
@@ -135,25 +144,33 @@ class LeMA:
         damp_down_cnt = 0
         damp_up_cnt = 0
         for i in range(self._max_iters):
-            lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
-            delta = self._solve_equation(J, lhs, rhs)
+            with nvtx.range(f"Add damp {i}"):
+                lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
+            with nvtx.range(f"Solve {i}"):
+                delta = self._solve_equation(J, lhs, rhs)
+
             if delta is not None:
                 # Update
-                t_delta = torch.from_dlpack(delta, device=self._flat.device)
+                with nvtx.range(f"Update {i}"):
+                    t_delta = torch.from_dlpack(delta, device=self._flat.device)
                 self._flat.sub_(t_delta)
 
                 # Check update criertia
-                new_loss = self._compute_loss(x, y)
+                with nvtx.range(f"Compute loss {i}"):
+                    new_loss = self._compute_loss(x, y)
+
                 if new_loss < loss:
                     # Succeed in updating
                     loss = new_loss
                     self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
                     damp_down_cnt += 1
-                    self._save_parameters()
+                    with nvtx.range(f"Save {i}"):
+                        self._save_parameters()
                     break
 
                 # Fail in updating
-                self._restore_parameters()
+                with nvtx.range(f"Restore {i}"):
+                    self._restore_parameters()
 
             # Fail in damping
             self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
@@ -164,6 +181,8 @@ class LeMA:
                 self._damp_cur = self._damp_start
                 terminate = True
                 break
+
+        nvtx.mark("End step")
 
         return LeMAResults(
             iterations=i,
