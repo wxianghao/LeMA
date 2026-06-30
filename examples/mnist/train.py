@@ -2,12 +2,14 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import torch.nn.functional as F
-import argparse
 import torch.distributed as dist
+import argparse
+import sys
 
 
 from lema import LeMA
 from legate.core import get_legate_runtime
+from legate.timing import time
 from torch import nn
 from torch.utils.data.distributed import DistributedSampler
 from loguru import logger
@@ -19,7 +21,11 @@ TOTAL_SIZE = 60_000
 BATCH_SIZE = 256
 TEST_BATCH_SIZE = 256
 SLICE_SIZE = 32
-DAMP_RATIO = 3.0
+DAMP_RATIO = 10.0
+
+""" Logging configuration
+"""
+LOG_PREFIX_FMT = "{time:YYYY-MM-DD HH:mm:ss.SSS}"
 
 
 ################################################################################
@@ -124,7 +130,18 @@ def main():
         "--log",
         type=str,
         default=None,
-        help=f"log file path (default: None)",
+        help=f"Log file path (default: None)",
+    )
+    # parser.add_argument(
+    #     "--csv",
+    #     type=str,
+    #     default=None,
+    #     help=f"CSV file path (default: None)",
+    # )
+    parser.add_argument(
+        "--precise",
+        action="store_true",
+        help=f"Enable the precise step time measurement",
     )
     args = parser.parse_args()
 
@@ -139,11 +156,18 @@ def main():
     ################################################################################
     # Setup logging
     ################################################################################
+    # Set logger
     logger.remove()
     if rank == 0:
-        logger.add(args.log, format="{time:YYYY-MM-DD HH:mm:ss} | {message}", enqueue=True)
+        # Log into the standard output
+        logger.add(sys.stdout, format=f"<green>{LOG_PREFIX_FMT}</green> | <level>{{message}}</level>", enqueue=True)
+        if args.log is not None:
+            # Log into the given file
+            logger.add(args.log, format=f"{LOG_PREFIX_FMT} | {{message}}", enqueue=True)
+    # Set log format
     epoch_width = len(str(args.epochs))
     batch_width = len(str(TOTAL_SIZE))
+    iter_width = 2
 
     ################################################################################
     # Prepare the dataset
@@ -168,17 +192,31 @@ def main():
         for batch_idx, (x, y) in enumerate(trainloader):
             x = x.to(device)
             y = y.to(device)
-            res = optim.step(x, y, args.slice_size)
+
+            if args.precise:
+                tbegin = time()
+                res = optim.step(x, y, args.slice_size)
+                tend = time()
+                duration = (tend - tbegin) * 1e-6
+            else:
+                res = optim.step(x, y, args.slice_size)
+
             # Logging
             if rank == 0:
                 processed = (batch_idx + 1) * world_size * x.shape[0]
-                logger.info(
-                    f"epoch {epoch:{epoch_width}d} | batch {processed:{batch_width}d}/{TOTAL_SIZE:{batch_width}d}  | iterations {res.iterations} | "
-                    f"loss {res.loss:.3e} | damp_factor {res.damp_factor:.3e}",
-                )
-        # Print epoch information
-        if rank == 0:
-            print(f"Train epoch: {epoch:{epoch_width}d}/{args.epochs:{epoch_width}d}\tLoss: {res.loss:.3e}")
+                log_dict = {
+                    "epoch": f"{epoch:{epoch_width}d}",
+                    "batch": f"{processed:{batch_width}d}/{TOTAL_SIZE:{batch_width}d}",
+                    "iterations": f"{res.iterations:{iter_width}d}",
+                    "loss": f"{res.loss:.3e}",
+                    "damp_factor": f"{res.damp_factor:.3e}",
+                }
+                if args.precise:
+                    log_dict["duration(s)"] = f"{duration:.3e}"
+
+                # if args.csv is not None:
+                log_msg = " | ".join([f"{key} {value}" for key, value in log_dict.items()])
+                logger.info(log_msg)
 
     ################################################################################
     # Destroy the process
