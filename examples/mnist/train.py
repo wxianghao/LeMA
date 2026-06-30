@@ -19,6 +19,7 @@ TOTAL_SIZE = 60_000
 BATCH_SIZE = 256
 TEST_BATCH_SIZE = 256
 SLICE_SIZE = 32
+DAMP_RATIO = 3.0
 
 
 ################################################################################
@@ -113,6 +114,13 @@ def main():
         help=f"Jacobian row slice size (default: {SLICE_SIZE})",
     )
     parser.add_argument(
+        "--damp-ratio",
+        type=float,
+        default=DAMP_RATIO,
+        metavar="N",
+        help=f"Change ratio of the damping factor (default: {DAMP_RATIO})",
+    )
+    parser.add_argument(
         "--log",
         type=str,
         default=None,
@@ -146,7 +154,11 @@ def main():
     # Initialze the model and the optimizer
     ################################################################################
     model = Net().to(device)
-    optim = LeMA(model, residual_fn)
+    optim = LeMA(
+        model=model,
+        residual_callable=residual_fn,
+        damp_ratio=args.damp_ratio,
+    )
 
     ################################################################################
     # Train
