@@ -21,7 +21,7 @@ class LeMA:
     def __init__(
         self,
         model: nn.Module,
-        residual_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        squared_residual_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         model_dtype: torch.dtype | None = None,
         optim_dtype: np.dtype = np.float32,
         max_iters: int = 10,
@@ -82,8 +82,9 @@ class LeMA:
         ################################################################################
         # Residual and loss functions
         ################################################################################
-        self._residual_fn = lambda y_hat, y: torch.flatten(residual_callable(y_hat, y))
-        self._loss_fn = lambda y_hat, y: self._residual_fn(y_hat, y).square().sum()
+        eps = 1e-8
+        self._residual_fn = lambda y_hat, y: torch.sqrt(torch.flatten(squared_residual_callable(y_hat, y)) + eps)
+        self._loss_fn = lambda y_hat, y: torch.sum(squared_residual_callable(y_hat, y))
 
         ################################################################################
         # Optimizer configuration

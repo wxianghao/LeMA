@@ -81,8 +81,8 @@ def load_dataset(args):
 ################################################################################
 # Residual function
 ################################################################################
-def residual_fn(a, b):
-    return torch.sqrt(F.nll_loss(a, b, reduction="none"))
+def squared_residual_fn(a, b):
+    return F.nll_loss(a, b, reduction="none")
 
 
 def main():
@@ -180,7 +180,7 @@ def main():
     model = Net().to(device)
     optim = LeMA(
         model=model,
-        residual_callable=residual_fn,
+        squared_residual_callable=squared_residual_fn,
         damp_ratio=args.damp_ratio,
     )
 
