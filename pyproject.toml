@@ -5,6 +5,7 @@ description = "LeMA: scalable Levenberg-Marquardt optimizer on multiple GPUs"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "loguru>=0.7.3",
     "nvidia-cupynumeric==26.1.0",
     "nvtx>=0.2.15",
     "torch>=2.11.0",
