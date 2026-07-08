@@ -14,6 +14,8 @@ from torch import nn
 from torch.utils.data.distributed import DistributedSampler
 from loguru import logger
 
+torch.manual_seed(913)
+
 """ Default values of Command-line arguments
 """
 EPOCHS = 15

@@ -6,7 +6,7 @@ import torch.cuda.nvtx as nvtx
 from torch.nn.utils import parameters_to_vector
 from typing import Callable, Any
 from torch import nn
-from .interop import gather_interop_1d, gather_interop_2d_row
+from .comm import gather_interop_1d, gather_interop_2d_row, torch_reduce_scalar
 from legate.core import get_legate_runtime
 
 
@@ -38,7 +38,7 @@ class LeMA:
         self._backup: torch.Tensor
         self._device: torch.device
         self._residual_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float | torch.Tensor]
         self._optim_dtype: np.dtype
         self._max_iters: int
         self._damp_start: float
@@ -101,7 +101,7 @@ class LeMA:
     def step(self, x: torch.Tensor, y: torch.Tensor, slice_size: int = 64):
         nvtx.mark("Start step")
         local_batch_size, model_size = x.shape[0], self._flat.shape[0]
-        batch_size = local_batch_size * self._world_size
+        batch_size = torch_reduce_scalar(local_batch_size, device=self._device)
 
         ################################################################################
         # Compute the Jacobian matrix

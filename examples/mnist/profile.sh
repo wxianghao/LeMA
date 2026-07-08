@@ -1,1 +1,1 @@
-nsys profile -t cuda bash examples/mnist/train.sh
+nsys profile -t cuda bash examples/mnist/train.sh "$@" 
