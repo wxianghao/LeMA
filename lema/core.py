@@ -6,8 +6,11 @@ import torch.cuda.nvtx as nvtx
 from torch.nn.utils import parameters_to_vector
 from typing import Callable, Any
 from torch import nn
-from .comm import gather_interop_1d, gather_interop_2d_row, torch_reduce_scalar
+from .comm import torch_reduce_scalar
 from legate.core import get_legate_runtime
+from legate.core.data_interface import as_logical_array
+from legate.core import TaskContext, VariantCode, VariantOptions, get_legate_runtime, broadcast
+from legate.core.task import task, OutputStore, InputStore
 
 
 class LeMAResults:
@@ -21,7 +24,7 @@ class LeMA:
     def __init__(
         self,
         model: nn.Module,
-        squared_residual_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        residual_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         model_dtype: torch.dtype | None = None,
         optim_dtype: np.dtype = np.float32,
         max_iters: int = 10,
@@ -30,117 +33,121 @@ class LeMA:
         damp_min: float = 1e-9,
         damp_max: float = 1e9,
     ) -> None:
-        ################################################################################
-        # Type annotations
-        ################################################################################
-        self._model: nn.Module
-        self._flat: torch.Tensor
-        self._backup: torch.Tensor
-        self._device: torch.device
-        self._residual_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float | torch.Tensor]
-        self._optim_dtype: np.dtype
-        self._max_iters: int
-        self._damp_start: float
-        self._damp_ratio: float
-        self._damp_min: float
-        self._damp_max: float
-        self._damp_cur: float
-        self._rank: int
-        self._world_size: int
-
-        ################################################################################
         # Get process and device information
-        ################################################################################
-        rt = get_legate_runtime()
-        self._rank = rt.node_id
-        self._world_size = rt.node_count
-        self._device = next(model.parameters()).device
+        runtime = get_legate_runtime()
+        self._rank: int = runtime.node_id
+        self._world_size: int = runtime.node_count
+        self._device: torch.device = next(model.parameters()).device
+        assert self._device.type == "cuda", f"Model should be on CUDA, but got {self._device.type}."
 
-        ################################################################################
-        # Model setup
-        ################################################################################
-        self._model = model
+        # Setup the model and flatten the parameters
+        self._model: nn.Module = model
         params = list(model.parameters())
-        # Determine the data type of the model
-        if model_dtype is None:
-            model_dtype = params[0].dtype
-        # Flatten the parameters
-        self._flat = parameters_to_vector(params).to(dtype=model_dtype)
-        self._flat.detach_()
-        # Bind the parameters to the flat one
+        self._flat: torch.Tensor = parameters_to_vector(params)
+        self._flat.detach()
+        if model_dtype is not None:
+            self._flat = self._flat.to(dtype=model_dtype)
+        # Rebind the parameters
         offset = 0
-        for p in model.parameters():
+        for p in params:
             size = p.numel()
             p.data = self._flat[offset : offset + size].view_as(p.data)
             offset += size
-        # Broadcast rank 0's parameters
+        # Synchronize all processes' parameters
         dist.broadcast(self._flat, 0)
         # Backup the parameters
-        self._backup = self._flat.clone()
+        self._backup: torch.Tensor = self._flat.clone()
 
-        ################################################################################
-        # Residual and loss functions
-        ################################################################################
-        eps = 1e-8
-        self._residual_fn = lambda y_hat, y: torch.sqrt(torch.flatten(squared_residual_callable(y_hat, y)) + eps)
-        self._loss_fn = lambda y_hat, y: torch.sum(squared_residual_callable(y_hat, y))
+        # Setup the residual and the loss functions
+        self._residual_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], float | torch.Tensor]
+        self._residual_fn = lambda y_hat, y: torch.flatten(residual_callable(y_hat, y))
+        self._loss_fn = lambda y_hat, y: torch.sum(self._residual_fn(y_hat, y).square())
 
-        ################################################################################
-        # Optimizer configuration
-        ################################################################################
-        self._optim_dtype = optim_dtype
-        self._max_iters = max_iters
-        self._damp_start = damp_start
-        self._damp_ratio = damp_ratio if damp_ratio >= 1.0 else 1.0 / damp_ratio
-        self._damp_min = damp_min
-        self._damp_max = damp_max
-        self._damp_cur = damp_start
+        # Configure the damping strategy
+        self._max_iters: int = max_iters
+        self._damp_start: float = damp_start
+        self._damp_ratio: float = damp_ratio if damp_ratio >= 1.0 else 1.0 / damp_ratio
+        self._damp_min: float = damp_min
+        self._damp_max: float = damp_max
+        self._damp_cur: float = damp_start
+
+        # Determine the optimization data type
+        self._optim_dtype: np.dtype = optim_dtype
 
     @torch.no_grad()
     def step(self, x: torch.Tensor, y: torch.Tensor, slice_size: int = 64):
-        nvtx.mark("Start step")
-        local_batch_size, model_size = x.shape[0], self._flat.shape[0]
-        batch_size = torch_reduce_scalar(local_batch_size, device=self._device)
+        runtime = get_legate_runtime()
+        block_size, model_size = x.shape[0], self._flat.shape[0]
+        batch_size = torch_reduce_scalar(block_size, device=self._device)
 
-        ################################################################################
-        # Compute the Jacobian matrix
-        ################################################################################
-        with nvtx.range("Init Jacobian"):
-            J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
-        # Compute the Jacobian slices
-        for start in range(0, local_batch_size, slice_size):
-            end = min(start + slice_size, local_batch_size)
-            with nvtx.range("Compute Jacobian slice"):
-                J_slice = self._compute_jacobian_slice(x[start:end], y[start:end])
-            # Gather slices
-            with nvtx.range("Gather Jacobian slice"):
-                gather_interop_2d_row(J_slice, J, start, end)
+        J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
 
-        ################################################################################
-        # Compute the residual
-        ################################################################################
-        with nvtx.range("Compute residual"):
-            r = np.empty(batch_size, dtype=self._optim_dtype)
+        @task(variants=(VariantCode.GPU,))
+        def compute_jacobian(ctx: TaskContext, dst: OutputStore):
+            """Computea and store the Jacobian"""
+            dst = torch.from_dlpack(dst, copy=False)
+            for row_start in range(0, block_size, slice_size):
+                row_end = min(block_size, row_start + slice_size)
+                slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
+                dst[row_start:row_end].copy_(slice)
+
+        @task(variants=(VariantCode.GPU,))
+        def compute_jacobian_overlap(ctx: TaskContext, dst: OutputStore):
+            """Compute and store the Jacobian, while overlapping computing and storing operations"""
+            compute_stream = torch.cuda.ExternalStream(ctx.task_stream)
+            with torch.cuda.stream(compute_stream):
+                dst = torch.from_dlpack(dst, copy=False)
+
+            store_stream = torch.cuda.Stream(device=dst.device)
+            store_stream.wait_stream(compute_stream)
+
+            for row_start in range(0, block_size, slice_size):
+                row_end = min(block_size, row_start + slice_size)
+                # Compute
+                with torch.cuda.stream(compute_stream):
+                    slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
+                    compute_done = compute_stream.record_event()
+                # Store
+                with torch.cuda.stream(store_stream):
+                    store_stream.wait_event(compute_done)
+                    dst[row_start:row_end].copy_(slice)
+                    slice.record_stream(store_stream)
+
+            compute_stream.wait_stream(store_stream)
+
+        partition = as_logical_array(J).data.partition_by_tiling((block_size, model_size))
+        task_ = runtime.create_manual_task(
+            compute_jacobian_overlap.library,
+            compute_jacobian_overlap.task_id,
+            (self._world_size,),
+        )
+        task_.add_output(partition)
+        task_.execute()
+
+        # Define residual compute task
+        @task(variants=(VariantCode.GPU,))
+        def compute_residual(ctx: TaskContext, dst: OutputStore):
+            dst_ = torch.from_dlpack(dst, copy=False).reshape(-1)
             r_slice = self._residual_fn(self._model(x), y)
-        with nvtx.range("Gather residual"):
-            gather_interop_1d(r_slice, r, 0, local_batch_size)
+            dst_.copy_(r_slice)
 
-        ################################################################################
+        # Compute the residual
+        r = np.empty(batch_size, dtype=self._optim_dtype)
+        partition = as_logical_array(r).data.partition_by_tiling((block_size,))
+        task_ = runtime.create_manual_task(
+            compute_residual.library,
+            compute_residual.task_id,
+            (self._world_size,),
+        )
+        task_.add_output(partition)
+        task_.execute()
+
         # Build LMA equation
-        ################################################################################
-        with nvtx.range("Build equation"):
-            JJ, rhs = self._build_equation(J, r)
+        JJ, rhs = self._build_equation(J, r)
 
-        ################################################################################
-        # Compute the initial loss
-        ################################################################################
-        with nvtx.range("Compute loss initial"):
-            loss = self._compute_loss(x, y)
-
-        ################################################################################
-        # LMA iteration
-        ################################################################################
+        # Start LMA iteration
+        loss = self._compute_loss(x, y)
         terminate = False
         damp_down_cnt = 0
         damp_up_cnt = 0
@@ -152,26 +159,22 @@ class LeMA:
 
             if delta is not None:
                 # Update
-                with nvtx.range(f"Update {i}"):
-                    t_delta = torch.from_dlpack(delta, device=self._flat.device)
+                t_delta = torch.from_dlpack(delta, device=self._flat.device)
                 self._flat.sub_(t_delta)
 
                 # Check update criertia
-                with nvtx.range(f"Compute loss {i}"):
-                    new_loss = self._compute_loss(x, y)
+                new_loss = self._compute_loss(x, y)
 
                 if new_loss < loss:
                     # Succeed in updating
                     loss = new_loss
                     self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
                     damp_down_cnt += 1
-                    with nvtx.range(f"Save {i}"):
-                        self._save_parameters()
+                    self._save_parameters()
                     break
 
                 # Fail in updating
-                with nvtx.range(f"Restore {i}"):
-                    self._restore_parameters()
+                self._restore_parameters()
 
             # Fail in damping
             self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
@@ -182,8 +185,6 @@ class LeMA:
                 self._damp_cur = self._damp_start
                 terminate = True
                 break
-
-        nvtx.mark("End step")
 
         return LeMAResults(
             iterations=i,

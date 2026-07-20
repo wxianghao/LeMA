@@ -24,6 +24,7 @@ BATCH_SIZE = 256
 TEST_BATCH_SIZE = 256
 SLICE_SIZE = 32
 DAMP_RATIO = 10.0
+PROFILE_ITERS = 3
 
 """ Logging configuration
 """
@@ -38,8 +39,8 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
+        # self.dropout1 = nn.Dropout(0.25)
+        # self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
 
@@ -49,11 +50,11 @@ class Net(nn.Module):
         x = self.conv2(x)
         x = F.relu(x)
         x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
+        # x = self.dropout1(x)
         x = torch.flatten(x, 1)
         x = self.fc1(x)
         x = F.relu(x)
-        x = self.dropout2(x)
+        # x = self.dropout2(x)
         x = self.fc2(x)
         output = F.log_softmax(x, dim=1)
         return output
@@ -83,8 +84,8 @@ def load_dataset(args):
 ################################################################################
 # Residual function
 ################################################################################
-def squared_residual_fn(a, b):
-    return F.nll_loss(a, b, reduction="none")
+def residual_fn(a, b):
+    return torch.sqrt(F.nll_loss(a, b, reduction="none") + 1e-9)
 
 
 def main():
@@ -141,6 +142,11 @@ def main():
     #     help=f"CSV file path (default: None)",
     # )
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=f"Enable the profiling mode",
+    )
+    parser.add_argument(
         "--precise",
         action="store_true",
         help=f"Enable the precise step time measurement",
@@ -182,13 +188,15 @@ def main():
     model = Net().to(device)
     optim = LeMA(
         model=model,
-        squared_residual_callable=squared_residual_fn,
+        residual_callable=residual_fn,
         damp_ratio=args.damp_ratio,
     )
 
     ################################################################################
     # Train
     ################################################################################
+    total_iter = 0
+
     for epoch in range(1, args.epochs + 1):
         trainsampler.set_epoch(epoch=epoch - 1)
         for batch_idx, (x, y) in enumerate(trainloader):
@@ -202,6 +210,8 @@ def main():
                 duration = (tend - tbegin) * 1e-6
             else:
                 res = optim.step(x, y, args.slice_size)
+
+            total_iter += 1
 
             # Logging
             if rank == 0:
@@ -219,6 +229,11 @@ def main():
                 # if args.csv is not None:
                 log_msg = " | ".join([f"{key} {value}" for key, value in log_dict.items()])
                 logger.info(log_msg)
+
+            if args.profile and total_iter >= PROFILE_ITERS:
+                break
+        if args.profile and total_iter >= PROFILE_ITERS:
+            break
 
     ################################################################################
     # Destroy the process
