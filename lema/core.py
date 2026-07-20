@@ -82,69 +82,60 @@ class LeMA:
         batch_size = torch_reduce_scalar(block_size, device=self._device)
 
         J = np.empty((batch_size, model_size), dtype=self._optim_dtype)
+        R = np.empty(batch_size, dtype=self._optim_dtype)
+
+        # @task(variants=(VariantCode.GPU,))
+        # def compute_jacobian(ctx: TaskContext, dst: OutputStore):
+        #     """Computea and store the Jacobian"""
+        #     dst = torch.from_dlpack(dst, copy=False)
+        #     for row_start in range(0, block_size, slice_size):
+        #         row_end = min(block_size, row_start + slice_size)
+        #         slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
+        #         dst[row_start:row_end].copy_(slice)
 
         @task(variants=(VariantCode.GPU,))
-        def compute_jacobian(ctx: TaskContext, dst: OutputStore):
-            """Computea and store the Jacobian"""
-            dst = torch.from_dlpack(dst, copy=False)
-            for row_start in range(0, block_size, slice_size):
-                row_end = min(block_size, row_start + slice_size)
-                slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
-                dst[row_start:row_end].copy_(slice)
-
-        @task(variants=(VariantCode.GPU,))
-        def compute_jacobian_overlap(ctx: TaskContext, dst: OutputStore):
+        def compute_jacobian_overlap(ctx: TaskContext, jac_dst: OutputStore, res_dst: OutputStore):
             """Compute and store the Jacobian, while overlapping computing and storing operations"""
             compute_stream = torch.cuda.ExternalStream(ctx.task_stream)
-            with torch.cuda.stream(compute_stream):
-                dst = torch.from_dlpack(dst, copy=False)
 
-            store_stream = torch.cuda.Stream(device=dst.device)
+            # Export legate slice to torch tensor
+            with torch.cuda.stream(compute_stream):
+                jac_dst = torch.from_dlpack(jac_dst, copy=False)
+                res_dst = torch.from_dlpack(res_dst, copy=False)
+                assert jac_dst.device == res_dst.device
+
+            store_stream = torch.cuda.Stream(device=jac_dst.device)
             store_stream.wait_stream(compute_stream)
 
             for row_start in range(0, block_size, slice_size):
                 row_end = min(block_size, row_start + slice_size)
                 # Compute
                 with torch.cuda.stream(compute_stream):
-                    slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
+                    jac_slice, res_slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
                     compute_done = compute_stream.record_event()
                 # Store
                 with torch.cuda.stream(store_stream):
                     store_stream.wait_event(compute_done)
-                    dst[row_start:row_end].copy_(slice)
-                    slice.record_stream(store_stream)
+                    jac_dst[row_start:row_end].copy_(jac_slice)
+                    res_dst[row_start:row_end].copy_(res_slice)
+                    jac_slice.record_stream(store_stream)
+                    res_slice.record_stream(store_stream)
 
             compute_stream.wait_stream(store_stream)
 
-        partition = as_logical_array(J).data.partition_by_tiling((block_size, model_size))
+        jac_partition = as_logical_array(J).data.partition_by_tiling((block_size, model_size))
+        res_partition = as_logical_array(R).data.partition_by_tiling((block_size,))
         task_ = runtime.create_manual_task(
             compute_jacobian_overlap.library,
             compute_jacobian_overlap.task_id,
             (self._world_size,),
         )
-        task_.add_output(partition)
-        task_.execute()
-
-        # Define residual compute task
-        @task(variants=(VariantCode.GPU,))
-        def compute_residual(ctx: TaskContext, dst: OutputStore):
-            dst_ = torch.from_dlpack(dst, copy=False).reshape(-1)
-            r_slice = self._residual_fn(self._model(x), y)
-            dst_.copy_(r_slice)
-
-        # Compute the residual
-        r = np.empty(batch_size, dtype=self._optim_dtype)
-        partition = as_logical_array(r).data.partition_by_tiling((block_size,))
-        task_ = runtime.create_manual_task(
-            compute_residual.library,
-            compute_residual.task_id,
-            (self._world_size,),
-        )
-        task_.add_output(partition)
+        task_.add_output(jac_partition)
+        task_.add_output(res_partition)
         task_.execute()
 
         # Build LMA equation
-        JJ, rhs = self._build_equation(J, r)
+        JJ, rhs = self._build_equation(J, R)
 
         # Start LMA iteration
         loss = self._compute_loss(x, y)
@@ -241,6 +232,10 @@ class LeMA:
 
         # Determine the Jacobian's evaluation function
         m, n = x.shape[0], self._flat.shape[0]
-        # TODO: jacrev may produce NaN
         jac_fn = torch.func.jacrev if m < n else torch.func.jacfwd
-        return jac_fn(lambda p: compute_residual(p, x, y))(self._flat)
+
+        def compute_residual_aux(flat):
+            residual = compute_residual(flat, x, y)
+            return residual, residual
+
+        return jac_fn(compute_residual_aux, has_aux=True)(self._flat)
