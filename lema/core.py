@@ -77,6 +77,8 @@ class LeMA:
 
     @torch.no_grad()
     def step(self, x: torch.Tensor, y: torch.Tensor, slice_size: int = 64):
+        nvtx.range_push('Step')
+
         runtime = get_legate_runtime()
         block_size, model_size = x.shape[0], self._flat.shape[0]
         batch_size = torch_reduce_scalar(block_size, device=self._device)
@@ -111,13 +113,15 @@ class LeMA:
                 row_end = min(block_size, row_start + slice_size)
                 # Compute
                 with torch.cuda.stream(compute_stream):
-                    jac_slice, res_slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
+                    with nvtx.range('Compute_slice'):
+                        jac_slice, res_slice = self._compute_jacobian_slice(x[row_start:row_end], y[row_start:row_end])
                     compute_done = compute_stream.record_event()
                 # Store
                 with torch.cuda.stream(store_stream):
                     store_stream.wait_event(compute_done)
-                    jac_dst[row_start:row_end].copy_(jac_slice)
-                    res_dst[row_start:row_end].copy_(res_slice)
+                    with nvtx.range('Store_slice'):
+                        jac_dst[row_start:row_end].copy_(jac_slice)
+                        res_dst[row_start:row_end].copy_(res_slice)
                     jac_slice.record_stream(store_stream)
                     res_slice.record_stream(store_stream)
 
@@ -176,6 +180,8 @@ class LeMA:
                 self._damp_cur = self._damp_start
                 terminate = True
                 break
+
+        nvtx.range_pop()
 
         return LeMAResults(
             iterations=i,
