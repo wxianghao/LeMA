@@ -185,7 +185,7 @@ class LeMA:
 
         return LeMAResults(
             iterations=i,
-            loss=loss,
+            loss=loss / batch_size,
             damp_factor=self._damp_cur,
         )
 
@@ -214,7 +214,7 @@ class LeMA:
         batch_size = x.shape[0] * self._world_size
         loss = self._loss_fn(self._model(x), y)
         dist.all_reduce(loss)
-        return float(loss.item()) / batch_size
+        return float(loss.item())
 
     @torch.no_grad()
     def _save_parameters(self):
