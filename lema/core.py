@@ -147,10 +147,8 @@ class LeMA:
         damp_down_cnt = 0
         damp_up_cnt = 0
         for i in range(self._max_iters):
-            with nvtx.range(f"Add damp {i}"):
-                lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
-            with nvtx.range(f"Solve {i}"):
-                delta = self._solve_equation(J, lhs, rhs)
+            lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
+            delta = self._solve_equation(J, lhs, rhs)
 
             if delta is not None:
                 # Update
