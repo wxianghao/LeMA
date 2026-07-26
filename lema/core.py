@@ -138,6 +138,12 @@ class LeMA:
         task_.add_output(res_partition)
         task_.execute()
 
+        @task(variants=(VariantCode.GPU,))
+        def apply_update(ctx: TaskContext, update: InputStore):
+            update = torch.from_dlpack(update)
+            with nvtx.range('Update_parameter'):
+                self._flat.sub_(update)
+
         # Build LMA equation
         JJ, rhs = self._build_equation(J, R)
 
@@ -148,12 +154,17 @@ class LeMA:
         damp_up_cnt = 0
         for i in range(self._max_iters):
             lhs = JJ + self._optim_dtype(self._damp_cur) * np.eye(JJ.shape[0], dtype=self._optim_dtype)
-            delta = self._solve_equation(J, lhs, rhs)
+            update = self._solve_equation(J, lhs, rhs)
 
-            if delta is not None:
+            if update is not None:
                 # Update
-                t_delta = torch.from_dlpack(delta, device=self._flat.device)
-                self._flat.sub_(t_delta)
+                task_ = runtime.create_manual_task(
+                    apply_update.library,
+                    apply_update.task_id,
+                    (self._world_size,),
+                )
+                task_.add_input(as_logical_array(update).data)
+                task_.execute()
 
                 # Check update criertia
                 new_loss = self._compute_loss(x, y)
