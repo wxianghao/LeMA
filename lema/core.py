@@ -43,8 +43,7 @@ class LeMA:
         # Setup the model and flatten the parameters
         self._model: nn.Module = model
         params = list(model.parameters())
-        self._flat: torch.Tensor = parameters_to_vector(params)
-        self._flat.detach()
+        self._flat: torch.Tensor = parameters_to_vector(params).detach()
         if model_dtype is not None:
             self._flat = self._flat.to(dtype=model_dtype)
         # Rebind the parameters
@@ -154,69 +153,46 @@ class LeMA:
             jtj.addmm_(j_slice.T, j_slice)
             jtr.addmv_(j_slice.T, res_slice)
 
-        # Gather tensor
-        if self._rank == 0:
-            x_gathered = x.new_empty((batch_size, *x.shape[1:]))
-            y_gathered = y.new_empty((batch_size, *y.shape[1:]))
-            x_gather_list = list(x_gathered.split(block_size, dim=0))
-            y_gather_list = list(y_gathered.split(block_size, dim=0))
-        else:
-            x_gathered = None
-            y_gathered = None
-            x_gather_list = None
-            y_gather_list = None
-        dist.gather(x.contiguous(), gather_list=x_gather_list, dst=0)
-        dist.gather(y.contiguous(), gather_list=y_gather_list, dst=0)
+        # All reduce the products
+        dist.all_reduce(jtj)
+        dist.all_reduce(jtr)
 
-        if self._rank == 0:
-            x = x_gathered
-            y = y_gathered
+        # Pre-allocate buffer
+        update = torch.empty_like(jtr)
+        lhs = torch.empty_like(jtj)
 
-        # Reduce partial products
-        dist.reduce(jtj, 0)
-        dist.reduce(jtr, 0)
+        # LeMA iterations
+        loss = self._loss_fn(self._model(x), y)
+        dist.all_reduce(loss)
+        loss = float(loss.item())
+        iterations = 0
+        while iterations < self._max_iters:
+            iterations += 1
+            # Solve the update
+            lhs.copy_(jtj)
+            lhs.diagonal().add_(self._damp_cur)
+            torch.linalg.solve(lhs, jtr, out=update)
+            # Attemp to update
+            self._flat.sub_(update)
+            # Check update criteria
+            new_loss = self._loss_fn(self._model(x), y)
+            dist.all_reduce(new_loss)
+            new_loss = float(new_loss.item())
+            if new_loss < loss:
+                # Succeed in updating
+                loss = new_loss
+                self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
+                self._backup.copy_(self._flat)
+                break
+            # Fail in updating
+            self._flat.copy_(self._backup)
+            self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
+            # Check terminating
+            if self._damp_cur >= self._damp_max:
+                self._damp_cur = self._damp_start
+                break
 
-        if self._rank == 0:
-            # Pre-allocate buffer
-            update = torch.empty_like(jtr)
-            lhs = torch.empty_like(jtj)
-            # LMA iterations
-            loss = self._loss_fn(self._model(x), y).item()
-            iterations = 0
-            while iterations < self._max_iters:
-                iterations += 1
-                # Solve the update
-                lhs.copy_(jtj)
-                lhs.diagonal().add_(self._damp_cur)
-                torch.linalg.solve(lhs, jtr, out=update)
-                # Update and check the criterion
-                self._flat.sub_(update)
-                new_loss = self._loss_fn(self._model(x), y).item()
-                if new_loss < loss:
-                    # Succeed in updating
-                    loss = new_loss
-                    self._damp_cur = max(self._damp_cur / self._damp_ratio, self._damp_min)
-                    self._backup.copy_(self._flat)
-                    break
-                # Fail in updating
-                self._flat.copy_(self._backup)
-                self._damp_cur = min(self._damp_cur * self._damp_ratio, self._damp_max)
-                # Check terminating
-                if self._damp_cur >= self._damp_max:
-                    self._damp_cur = self._damp_start
-                    break
-
-        # Broadcast updated parameters
-        dist.broadcast(self._flat, 0)
-        dist.broadcast(self._backup, 0)
-
-        if self._rank == 0:
-            res = [LeMAResult(loss=loss, iterations=iterations)]
-        else:
-            res = [None]
-
-        dist.broadcast_object_list(res, 0)
-        return res[0]
+        return LeMAResult(loss=loss / batch_size, iterations=iterations)
 
     def _compute_jacobian_slice_reverse(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
