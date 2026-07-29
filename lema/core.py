@@ -78,19 +78,27 @@ class LeMA:
         # Config optimizer data type and solver
         self._optim_dtype: torch.dtype = optim_dtype
 
+        # Performace parameters
+        self._JACOBIAN_EVAL_COEFF: float
+
     def step(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> LeMAResult:
         # Check devices of tensors
         assert x.device == self._device, f"Tensor x should be on the device {self._device}, but got {x.device}."
         assert y.device == self._device, f"Tensor y should be on the device {self._device}, but got {y.device}."
 
         # Get size information
-        block_size = x.size()[0]
+        block_size = x.size(0)
         batch_size = self._world_size * block_size
-        model_size = self._flat.size()[0]
+        model_size = self._flat.size(0)
 
         # Get slicing information
         row_slice_size = kwargs.get("row_slice_size", block_size)
         col_slice_size = kwargs.get("col_slice_size", model_size)
+        slices_per_shard = kwargs.get("slices_per_shard", 1)
+        if row_slice_size <= 0:
+            raise ValueError("`row_slice_size` must be greater than zero.")
+        if slices_per_shard <= 0:
+            raise ValueError("`slices_per_shard` must be greater than zero.")
 
         # Determine the execution path
         overdetermined = batch_size > model_size
@@ -103,6 +111,7 @@ class LeMA:
                 block_size=block_size,
                 row_slice_size=row_slice_size,
                 col_slice_size=col_slice_size,
+                slices_per_shard=slices_per_shard,
             )
         else:
             res = self._step_underdetermined(
@@ -113,12 +122,15 @@ class LeMA:
                 block_size=block_size,
                 row_slice_size=row_slice_size,
                 col_slice_size=col_slice_size,
+                slices_per_shard=slices_per_shard,
             )
 
         return res
 
     def _step_underdetermined(self, x: torch.Tensor, y: torch.Tensor, **kwargs):
-        raise NotImplemented("`_step_underdetermined` is not implemented")
+        """
+        Levenberg-Marquardt step using (J @ J.T + damp * I) @ u = r; v = J.T @ u
+        """
         # Get size information
         block_size = kwargs["block_size"]
         batch_size = kwargs["batch_size"]
@@ -128,9 +140,13 @@ class LeMA:
         col_slice_size = kwargs["col_slice_size"]
 
         # Allocate local products
+        jjt = torch.zeros((batch_size, batch_size), device=self._device, dtype=self._optim_dtype)
 
     @torch.no_grad()
     def _step_overdetermined(self, x: torch.Tensor, y: torch.Tensor, **kwargs):
+        """
+        Levenberg-Marquardt step using (J.T @ J + damp * I) @ v = J.T @ r
+        """
         # Get size information
         block_size = kwargs["block_size"]
         batch_size = kwargs["batch_size"]
@@ -138,20 +154,31 @@ class LeMA:
         # Get slicing information
         row_slice_size = kwargs["row_slice_size"]
         col_slice_size = kwargs["col_slice_size"]
+        slices_per_shard = kwargs["slices_per_shard"]
+        shard_size = row_slice_size * slices_per_shard
 
         # Allocate local products
         jtj = torch.zeros((model_size, model_size), device=self._device, dtype=self._optim_dtype)
         jtr = jtj.new_zeros(model_size)
 
-        # Compute Jacobian row slices and accumulate the product to J.T @ J and J.T @ r
-        for row_start in range(0, block_size, row_slice_size):
-            row_end = min(block_size, row_start + row_slice_size)
-            x_slice, y_slice = x[row_start:row_end], y[row_start:row_end]
-            j_slice, res_slice = self._compute_jacobian_slice_reverse(x_slice, y_slice)
-
-            # Reduce to the local results
-            jtj.addmm_(j_slice.T, j_slice)
-            jtr.addmv_(j_slice.T, res_slice)
+        # Merge multiple slices into a shard before accumulating jtj and jtr
+        for shard_start in range(0, block_size, shard_size):
+            shard_end = min(block_size, shard_start + shard_size)
+            jacobian_slices = []
+            residual_slices = []
+            for row_start in range(shard_start, shard_end, row_slice_size):
+                row_end = min(shard_end, row_start + row_slice_size)
+                # Compute row slice
+                x_slice, y_slice = x[row_start:row_end], y[row_start:row_end]
+                # TODO: slicing the parameter dimension
+                j_slice, res_slice = self._compute_jacobian_slice_auto(x_slice, y_slice)
+                jacobian_slices.append(j_slice)
+                residual_slices.append(res_slice)
+            # Accumulate to the locals
+            j_shard = torch.cat(jacobian_slices, dim=0)
+            res_shard = torch.cat(residual_slices, dim=0)
+            jtj.addmm_(j_shard.T, j_shard)
+            jtr.addmv_(j_shard.T, res_shard)
 
         # All reduce the products
         dist.all_reduce(jtj)
@@ -162,9 +189,7 @@ class LeMA:
         lhs = torch.empty_like(jtj)
 
         # LeMA iterations
-        loss = self._loss_fn(self._model(x), y)
-        dist.all_reduce(loss)
-        loss = float(loss.item())
+        loss = self._compute_and_all_reduce_loss(x, y)
         iterations = 0
         while iterations < self._max_iters:
             iterations += 1
@@ -175,9 +200,7 @@ class LeMA:
             # Attemp to update
             self._flat.sub_(update)
             # Check update criteria
-            new_loss = self._loss_fn(self._model(x), y)
-            dist.all_reduce(new_loss)
-            new_loss = float(new_loss.item())
+            new_loss = self._compute_and_all_reduce_loss(x, y)
             if new_loss < loss:
                 # Succeed in updating
                 loss = new_loss
@@ -194,9 +217,30 @@ class LeMA:
 
         return LeMAResult(loss=loss / batch_size, iterations=iterations)
 
+    @torch.no_grad()
+    def _compute_and_all_reduce_loss(self, x: torch.Tensor, y: torch.Tensor) -> float:
+        loss = self._loss_fn(self._model(x), y)
+        dist.all_reduce(loss)
+        return float(loss.item())
+
+    def _is_forward(self, row_size: int):
+        COEFF = 3
+        col_size = self._flat.size(0)
+        return row_size > col_size * COEFF
+
+    def _compute_jacobian_slice_auto(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Compute a Jacobian slice with respect to all the parameters,
+        automatically picking the optimizer mode.
+        """
+        if self._is_forward(x.size(0)):
+            return self._compute_jacobian_slice_forward(x, y)
+        else:
+            return self._compute_jacobian_slice_reverse(x, y)
+
     def _compute_jacobian_slice_reverse(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
-        Compute a Jacobian slice using the reverse mode.
+        Compute a Jacobian slice with respect to all the parameters using the reverse mode.
         """
 
         def compute_residual(flat):
@@ -210,7 +254,23 @@ class LeMA:
 
         return torch.func.jacrev(compute_residual, has_aux=True)(self._flat)
 
-    def _compute_jacobian_slice_forward(
+    def _compute_jacobian_slice_forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Compute a Jacobian slice with respect to all the parameters using the forward mode.
+        """
+
+        def compute_residual(flat):
+            params = {
+                name: tensor.view_as(param)
+                for (name, param), tensor in zip(self._named_params, torch.split(flat, self._param_sizes))
+            }
+            y_hat = torch.func.functional_call(self._model, params, x)
+            res = self._residual_fn(y_hat, y)
+            return res, res
+
+        return torch.func.jacfwd(compute_residual, has_aux=True)(self._flat)
+
+    def _compute_jacobian_slice_forward_range(
         self, x: torch.Tensor, y: torch.Tensor, param_start: int, param_end: int
     ) -> torch.Tensor:
         """
