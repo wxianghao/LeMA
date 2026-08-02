@@ -13,7 +13,9 @@ class LeMAResult:
     loss: float
     iterations: int
     terminate: bool
+    damp: float = -1.0
     overdetermined: bool = False
+    batch_size: int = -1
 
 
 class LeMA(JacobianModel):
@@ -133,6 +135,8 @@ class LeMA(JacobianModel):
             )
 
         res.overdetermined = overdetermined
+        res.batch_size = batch_size
+        res.damp = self._damp
         return res
 
     def _step_overdetermined(
@@ -208,7 +212,11 @@ class LeMA(JacobianModel):
                 terminate = True
                 break
 
-        return LeMAResult(loss=loss / batch_size, iterations=iterations, terminate=terminate)
+        return LeMAResult(
+            loss=loss / batch_size,
+            iterations=iterations,
+            terminate=terminate,
+        )
 
     def _step_underdetermined(
         self,
@@ -305,4 +313,8 @@ class LeMA(JacobianModel):
                 terminate = True
                 break
 
-        return LeMAResult(loss=loss / batch_size, iterations=iterations, terminate=terminate)
+        return LeMAResult(
+            loss=loss / batch_size,
+            iterations=iterations,
+            terminate=terminate,
+        )
