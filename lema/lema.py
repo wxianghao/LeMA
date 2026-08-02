@@ -287,9 +287,9 @@ class LeMA(JacobianModel):
             self._flat.sub_(update)
             # Check update criterion
             with torch.no_grad():
-                new_loss = self._loss_fn(self._model(x), y)
-                dist.all_reduce(new_loss)
-                new_loss = float(new_loss.item())
+                new_loss = self._loss_fn(self._model(x), y).cpu()
+                dist.all_reduce(new_loss, group=self._gloo_group)
+                new_loss = new_loss.item()
             if new_loss < loss:
                 # Succeed
                 loss = new_loss
