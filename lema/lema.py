@@ -282,7 +282,7 @@ class LeMA(JacobianModel):
             # Calculate the update
             update.zero_()
             for start, end in iter_batches(block_size, shard_size):
-                update.add_(self.vjp(x[start:end], y[start:end], solution[block_start : block_start + block_size]))
+                update.add_(self.vjp(x[start:end], y[start:end], solution[block_start + start : block_start + end]))
             dist.all_reduce(update)
             self._flat.sub_(update)
             # Check update criterion
