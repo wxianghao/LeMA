@@ -1,1 +1,2 @@
-from .core import LeMA
+from .lema import LeMA
+from .jacobian import JacobianModel
