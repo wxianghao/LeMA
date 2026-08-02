@@ -78,27 +78,6 @@ class JacobianModel(nn.Module):
         return jtv
 
     @torch.no_grad()
-    def jvp_batch(self, x: torch.Tensor, y: torch.Tensor, W: torch.Tensor, slice_size: int) -> torch.Tensor:
-        compute_residual = lambda p: self._stateless_residual(p, x, y)
-
-        def single_jvp(v):
-            _, jv = torch.func.jvp(compute_residual, (self._flat,), (v,))
-            return jv
-
-        return torch.vmap(single_jvp, chunk_size=slice_size)(W)
-
-    @torch.no_grad()
-    def vjp_batch(self, x: torch.Tensor, y: torch.Tensor, W: torch.Tensor, slice_size) -> torch.Tensor:
-        compute_residual = lambda p: self._stateless_residual(p, x, y)
-        _, vjp_fn = torch.func.vjp(compute_residual, self._flat)
-
-        def single_vjp(v):
-            (jtv,) = vjp_fn(v)
-            return jtv
-
-        return torch.vmap(single_vjp, chunk_size=slice_size)(W)
-
-    @torch.no_grad()
     def jacrev(
         self, x: torch.Tensor, y: torch.Tensor, has_residual: bool = False, slice_size: Optional[int] = None
     ) -> torch.Tensor:
