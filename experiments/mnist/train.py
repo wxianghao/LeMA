@@ -18,17 +18,12 @@ exp_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if exp_dir not in sys.path:
     sys.path.insert(0, exp_dir)
 
-from common.parser import add_train_arguments, TrainDefaults
-from common.bench import measure_peak_memory
-
-argument_defaults = TrainDefaults(
-    block_size=1024,
-    shard_size=128,
-    slice_size=32,
-    damp_ratio=10.0,
-    epochs=10,
-    test_block_size=1024,
+from common.parser import (
+    add_train_arguments,
+    add_lema_arguments,
+    add_profile_arguments,
 )
+from common.bench import measure_peak_memory
 
 TEST_INTERVAL = 1
 DATA_DIR = ".data"
@@ -126,7 +121,22 @@ def residual_fn(a, b):
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser = add_train_arguments(parser, argument_defaults)
+    parser = add_lema_arguments(
+        parser,
+        block_size=1024,
+        shard_size=128,
+        slice_size=32,
+        damp_ratio=10.0,
+    )
+    parser = add_train_arguments(
+        parser,
+        epochs=10,
+        test_block_size=1024,
+    )
+    parser = add_profile_arguments(
+        parser,
+        profile_steps=5,
+    )
     parser.add_argument(
         "--test-interval",
         type=int,
@@ -184,6 +194,8 @@ def main():
         logger.info(f"Jacobian shard memory: {jacobian_shard_bytes / 1e9:.3f} GB")
 
     # Train
+    nsteps = 0
+    terminate = False
     for epoch in range(1, args.epochs + 1):
         cast(DistributedSampler, trainloader.sampler).set_epoch(epoch - 1)
         batch_start = 1
@@ -192,8 +204,15 @@ def main():
             y = y.to(device)
             res = optim.step(x, y, shard_size=args.shard_size, slice_size=args.slice_size)
             log_train(rank=rank, result=res, epoch=epoch, batch_start=batch_start)
+            terminate = terminate
             batch_start += res.batch_size
-
+            nsteps += 1
+            if args.profile and nsteps >= args.profile_steps:
+                terminate = True
+            if terminate:
+                break
+        if terminate:
+            break
         # Test
         if epoch % args.test_interval == 0:
             model.eval()

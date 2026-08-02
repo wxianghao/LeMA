@@ -2,25 +2,18 @@ import argparse
 from dataclasses import dataclass
 
 
-@dataclass
-class LeMADefaults:
-    block_size: int
-    shard_size: int
-    slice_size: int
-    damp_ratio: float
-
-
-@dataclass
-class TrainDefaults(LeMADefaults):
-    epochs: int
-    test_block_size: int
-
-
-def add_lema_arguments(parser: argparse.ArgumentParser, defaults: LeMADefaults) -> argparse.ArgumentParser:
+def add_lema_arguments(
+    parser: argparse.ArgumentParser,
+    block_size: int,
+    shard_size: int,
+    slice_size: int,
+    damp_ratio: float,
+    **kwargs,
+) -> argparse.ArgumentParser:
     parser.add_argument(
         "--block-size",
         type=int,
-        default=defaults.block_size,
+        default=block_size,
         metavar="N",
         help=f"number of samples per process for training",
     )
@@ -28,7 +21,7 @@ def add_lema_arguments(parser: argparse.ArgumentParser, defaults: LeMADefaults) 
     parser.add_argument(
         "--shard-size",
         type=int,
-        default=defaults.shard_size,
+        default=shard_size,
         metavar="N",
         help=f"shard size for matrix computations",
     )
@@ -36,7 +29,7 @@ def add_lema_arguments(parser: argparse.ArgumentParser, defaults: LeMADefaults) 
     parser.add_argument(
         "--slice-size",
         type=int,
-        default=defaults.slice_size,
+        default=slice_size,
         metavar="N",
         help=f"slice size for Jacobian evaluation",
     )
@@ -44,7 +37,7 @@ def add_lema_arguments(parser: argparse.ArgumentParser, defaults: LeMADefaults) 
     parser.add_argument(
         "--damp-ratio",
         type=float,
-        default=defaults.damp_ratio,
+        default=damp_ratio,
         metavar="N",
         help=f"change ratio of the damping factor",
     )
@@ -52,13 +45,16 @@ def add_lema_arguments(parser: argparse.ArgumentParser, defaults: LeMADefaults) 
     return parser
 
 
-def add_train_arguments(parser: argparse.ArgumentParser, defaults: TrainDefaults) -> argparse.ArgumentParser:
-    parser = add_lema_arguments(parser, defaults)
-
+def add_train_arguments(
+    parser: argparse.ArgumentParser,
+    epochs: int,
+    test_block_size: int,
+    **kwargs,
+) -> argparse.ArgumentParser:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=defaults.epochs,
+        default=epochs,
         metavar="N",
         help=f"number of epochs to train",
     )
@@ -66,9 +62,27 @@ def add_train_arguments(parser: argparse.ArgumentParser, defaults: TrainDefaults
     parser.add_argument(
         "--test-block-size",
         type=int,
-        default=defaults.test_block_size,
+        default=test_block_size,
         metavar="N",
         help=f"input block size for testing",
+    )
+
+    return parser
+
+
+def add_profile_arguments(parser: argparse.ArgumentParser, profile_steps: int, **kwargs) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=f"Enable the profiling mode",
+    )
+
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=profile_steps,
+        metavar="N",
+        help=f"number of steps before exiting profiling",
     )
 
     return parser
