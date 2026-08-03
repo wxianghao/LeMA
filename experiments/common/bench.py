@@ -1,20 +1,31 @@
+import gc
 import torch
 
-import argparse
-import gc
-import statistics
-import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Generator
 
 
-def measure_peak_memory(fn, device: torch.device) -> int:
-    """Measure peak additional CUDA memory used by one invocation."""
+@dataclass
+class PeakMemoryMeasurement:
+    """Peak additional CUDA memory measured by ``measure_peak_memory``."""
+
+    peak_bytes: int = 0
+
+
+@contextmanager
+def measure_peak_memory(device: torch.device) -> Generator[PeakMemoryMeasurement, None, None]:
+    """Measure peak additional CUDA memory used inside the context."""
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
     baseline = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
-    output = fn()
-    torch.cuda.synchronize(device)
-    peak_memory = torch.cuda.max_memory_allocated(device) - baseline
-    del output
-    return max(0, peak_memory)
+    measurement = PeakMemoryMeasurement()
+
+    try:
+        yield measurement
+    finally:
+        torch.cuda.synchronize(device)
+        peak_memory = torch.cuda.max_memory_allocated(device) - baseline
+        measurement.peak_bytes = max(0, peak_memory)

@@ -23,7 +23,7 @@ from common.parser import (
     add_lema_arguments,
     add_profile_arguments,
 )
-from common.bench import measure_peak_memory
+from common.bench import measure_peak_memory, PeakMemoryMeasurement
 
 TEST_INTERVAL = 1
 DATA_DIR = ".data"
@@ -70,7 +70,7 @@ def log_train(rank: int, result: lema.LeMAResult, epoch: int, batch_start: int):
     if rank != 0:
         return
     step_method = "overdetermined" if result.overdetermined else "underdetermined"
-    msg = "epoch: {epoch} | batch: [{start}, {end}] | loss: {loss:.3e} | method: {method} | iterations: {iterations} | damp: {damp:.3e}".format(
+    msg = "step info: epoch: {epoch} | batch: [{start}, {end}] | loss: {loss:.3e} | method: {method} | iterations: {iterations} | damp: {damp:.3e}".format(
         epoch=epoch,
         start=batch_start,
         end=batch_start + result.batch_size - 1,
@@ -82,10 +82,22 @@ def log_train(rank: int, result: lema.LeMAResult, epoch: int, batch_start: int):
     logger.info(msg)
 
 
+def log_epoch(rank: int, epoch: int, loss: float, mem_in_bytes: int):
+    if rank != 0:
+        return
+    mem_in_gb = mem_in_bytes / 1e9
+    msg = "epoch info | epoch: {epoch} | loss: {loss:.3e} | memory: {mem:.2f} GB".format(
+        epoch=epoch,
+        loss=loss,
+        mem=mem_in_gb,
+    )
+    logger.info(msg)
+
+
 def log_test(rank: int, epoch: int, loss: float, acc: float):
     if rank != 0:
         return
-    msg = "epoch: {epoch} | loss: {loss:.3e} | accuracy: {acc:.2%}".format(
+    msg = "test info | epoch: {epoch} | loss: {loss:.3e} | accuracy: {acc:.2%}".format(
         epoch=epoch,
         loss=loss,
         acc=acc,
@@ -198,19 +210,25 @@ def main():
     terminate = False
     for epoch in range(1, args.epochs + 1):
         cast(DistributedSampler, trainloader.sampler).set_epoch(epoch - 1)
+        loss = 0.0
+        num_samples = 0
         batch_start = 1
-        for x, y in trainloader:
-            x = x.to(device)
-            y = y.to(device)
-            res = optim.step(x, y, shard_size=args.shard_size, slice_size=args.slice_size)
-            log_train(rank=rank, result=res, epoch=epoch, batch_start=batch_start)
-            terminate = terminate
-            batch_start += res.batch_size
-            nsteps += 1
-            if args.profile and nsteps >= args.profile_steps:
-                terminate = True
-            if terminate:
-                break
+        with measure_peak_memory(device=device) as mem:  # Measure peak memory usage
+            for x, y in trainloader:
+                x = x.to(device)
+                y = y.to(device)
+                res = optim.step(x, y, shard_size=args.shard_size, slice_size=args.slice_size)
+                loss += res.loss
+                num_samples += res.batch_size
+                terminate = res.terminate
+                log_train(rank=rank, result=res, epoch=epoch, batch_start=batch_start)
+                batch_start += res.batch_size
+                nsteps += 1
+                if args.profile and nsteps >= args.profile_steps:
+                    terminate = True
+                if terminate:
+                    break
+        log_epoch(rank=rank, epoch=epoch, loss=loss, mem_in_bytes=mem.peak_bytes)
         if terminate:
             break
         # Test
