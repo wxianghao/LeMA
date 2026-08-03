@@ -4,15 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lema"
-version = "0.0.1"
+version = "0.0.1.dev1"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Xianghao Wang", email = "wxianghao@outlook.com" }]
-dependencies = [
-    "loguru>=0.7.3",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-]
+dependencies = ["loguru>=0.7.3", "torch>=2.11.0", "torchvision>=0.26.0"]
 
 [tool.setuptools]
 packages = ["lema"]
