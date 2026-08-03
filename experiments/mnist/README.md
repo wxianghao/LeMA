@@ -18,7 +18,12 @@ The command-line arguments are defined in the table:
 | `--log` | `str` | `None` | Path to the log file. |
 
 
-## Result
+## Run
+Please ensure MNIST dataset is downloaded before executing training scripts:
+```bash
+bash scripts/download_mnist.sh
+```
+
 Here is an example of training on a single node of 2 NVIDIA Tesla V100 PCIE (32GB) GPUs:
 ```bash
 torchrun --standalone --nproc_per_node 2 experiments/mnist/train.py \
