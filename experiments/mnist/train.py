@@ -70,7 +70,7 @@ def log_train(rank: int, result: lema.LeMAResult, epoch: int, batch_start: int):
     if rank != 0:
         return
     step_method = "overdetermined" if result.overdetermined else "underdetermined"
-    msg = "step info: epoch: {epoch} | batch: [{start}, {end}] | loss: {loss:.3e} | method: {method} | iterations: {iterations} | damp: {damp:.3e}".format(
+    msg = "step info | epoch: {epoch} | batch: [{start}, {end}] | loss: {loss:.3e} | method: {method} | iterations: {iterations} | damp: {damp:.3e}".format(
         epoch=epoch,
         start=batch_start,
         end=batch_start + result.batch_size - 1,
