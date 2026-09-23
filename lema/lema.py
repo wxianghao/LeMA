@@ -24,14 +24,39 @@ class LeMA(JacobianModel):
     _backup: torch.Tensor
     _loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
     _max_iters: int
-    _damp_start: float
-    _damp_end: float
-    _damp_min: float
-    _damp_max: float
-    _damp: float
     _device: torch.device
     _optim_dtype: torch.dtype = torch.float32
     _gloo_group: dist.group
+
+    class _Damping:
+        val: float
+        startval: float
+        minval: float
+        maxval: float
+        ratio: float
+
+        def __init__(
+            self, startval: float, minval: float, maxval: float, ratio: float
+        ) -> None:
+            self.startval = startval
+            self.minval = minval
+            self.maxval = maxval
+            self.ratio = ratio if ratio >= 1.0 else 1.0 / ratio
+            self.val = startval
+
+        def on_success(self) -> None:
+            self.val = max(self.val / self.ratio, self.minval)
+
+        def on_fail(self) -> None:
+            self.val = min(self.val * self.ratio, self.maxval)
+
+        def terminate(self) -> bool:
+            if self.val < self.maxval:
+                return False
+            self.val = self.startval
+            return True
+
+    _damping: _Damping
 
     def __init__(
         self,
@@ -80,11 +105,12 @@ class LeMA(JacobianModel):
 
         # Configure the damping strategy
         self._max_iters: int = max_iters
-        self._damp_start: float = damp_start
-        self._damp_ratio: float = damp_ratio if damp_ratio >= 1.0 else 1.0 / damp_ratio
-        self._damp_min: float = damp_min
-        self._damp_max: float = damp_max
-        self._damp: float = damp_start
+        self._damping = self._Damping(
+            startval=damp_start,
+            minval=damp_min,
+            maxval=damp_max,
+            ratio=damp_ratio,
+        )
 
         # Config optimizer data type
         self._optim_dtype = optim_dtype
@@ -139,7 +165,7 @@ class LeMA(JacobianModel):
 
         res.overdetermined = overdetermined
         res.batch_size = batch_size
-        res.damp = self._damp
+        res.damp = self._damping.val
         return res
 
     def _step_overdetermined(
@@ -192,7 +218,7 @@ class LeMA(JacobianModel):
             iterations += 1
             # Solve and update
             damped_jtj.copy_(jtj)
-            damped_jtj.diagonal().add_(self._damp)
+            damped_jtj.diagonal().add_(self._damping.val)
             torch.linalg.solve(damped_jtj, jtr, out=update)
             self._flat.sub_(update)
             # Check update criterion
@@ -203,15 +229,14 @@ class LeMA(JacobianModel):
             if new_loss < loss:
                 # Succeed
                 loss = new_loss
-                self._damp = max(self._damp / self._damp_ratio, self._damp_min)
+                self._damping.on_success()
                 self._backup.copy_(self._flat)
                 break
             # Fail
             self._flat.copy_(self._backup)
-            self._damp = min(self._damp * self._damp_ratio, self._damp_max)
+            self._damping.on_fail()
             # Check termination
-            if self._damp >= self._damp_max:
-                self._damp = self._damp_start
+            if self._damping.terminate():
                 terminate = True
                 break
 
@@ -288,7 +313,7 @@ class LeMA(JacobianModel):
             iterations += 1
             # Solve the equation
             damped_jtj.copy_(jjt)
-            damped_jtj.diagonal().add_(self._damp)
+            damped_jtj.diagonal().add_(self._damping.val)
             torch.linalg.solve(damped_jtj, r, out=solution)
             # Calculate the update
             update.zero_()
@@ -310,15 +335,14 @@ class LeMA(JacobianModel):
             if new_loss < loss:
                 # Succeed
                 loss = new_loss
-                self._damp = max(self._damp / self._damp_ratio, self._damp_min)
+                self._damping.on_success()
                 self._backup.copy_(self._flat)
                 break
             # Fail
             self._flat.copy_(self._backup)
-            self._damp = min(self._damp * self._damp_ratio, self._damp_max)
+            self._damping.on_fail()
             # Check termination
-            if self._damp >= self._damp_max:
-                self._damp = self._damp_start
+            if self._damping.terminate():
                 terminate = True
                 break
 
