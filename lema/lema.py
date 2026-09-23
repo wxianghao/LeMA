@@ -26,8 +26,8 @@ class LeMA(JacobianModel):
     _max_iters: int
     _damp_start: float
     _damp_end: float
-    _damp_min = float
-    _damp_max = float
+    _damp_min: float
+    _damp_max: float
     _damp: float
     _device: torch.device
     _optim_dtype: torch.dtype = torch.float32
@@ -64,7 +64,9 @@ class LeMA(JacobianModel):
 
         # Check model's device
         if self._device.type != "cuda":
-            raise RuntimeError(f"Model should be on a CUDA device, but got {self._device.type}.")
+            raise RuntimeError(
+                f"Model should be on a CUDA device, but got {self._device.type}."
+            )
 
         # Synchronize all processes' model parameters
         dist.broadcast(self._flat, 0)
@@ -111,6 +113,7 @@ class LeMA(JacobianModel):
 
         # Choose the execution path
         overdetermined = False
+
         # overdetermined = batch_size > model_size
         if overdetermined:
             # Invoke the overdetermined step
@@ -290,7 +293,13 @@ class LeMA(JacobianModel):
             # Calculate the update
             update.zero_()
             for start, end in iter_batches(block_size, shard_size):
-                update.add_(self.vjp(x[start:end], y[start:end], solution[block_start + start : block_start + end]))
+                update.add_(
+                    self.vjp(
+                        x[start:end],
+                        y[start:end],
+                        solution[block_start + start : block_start + end],
+                    )
+                )
             dist.all_reduce(update)
             self._flat.sub_(update)
             # Check update criterion
