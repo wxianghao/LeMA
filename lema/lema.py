@@ -68,7 +68,7 @@ class LeMA(JacobianModel):
         max_iters: int = 10,
         damp_start: float = 1e-3,
         damp_ratio: float = 10.0,
-        damp_min: float = 1e-9,
+        damp_min: float = 1e-1,
         damp_max: float = 1e9,
     ) -> None:
         super().__init__(model=model, residual_fn=residual_fn, model_dtype=model_dtype)
@@ -283,7 +283,7 @@ class LeMA(JacobianModel):
             )
             d_inv.add_(j_shard.square().sum(dim=0))
         dist.all_reduce(d_inv)
-        d_inv.clamp_(min=self._eps).reciprocal_()
+        d_inv.clamp_(min=0.01 * d_inv.mean()).reciprocal_()
 
         # Allocate memory for products
         jjt_block = self._template.new_empty((block_size, batch_size))
