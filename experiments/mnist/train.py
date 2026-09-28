@@ -59,7 +59,11 @@ def init_logger(rank: int, args):
         return
     logger.remove()
     # Log into the standard output
-    logger.add(sys.stdout, format=f"<green>{LOG_PREFIX_FMT}</green> | <level>{{message}}</level>", enqueue=True)
+    logger.add(
+        sys.stdout,
+        format=f"<green>{LOG_PREFIX_FMT}</green> | <level>{{message}}</level>",
+        enqueue=True,
+    )
     if args.log is not None:
         open(args.log, "w").close()
         # Log into the given file
@@ -86,10 +90,12 @@ def log_epoch(rank: int, epoch: int, loss: float, mem_in_bytes: int):
     if rank != 0:
         return
     mem_in_gb = mem_in_bytes / 1e9
-    msg = "epoch info | epoch: {epoch} | loss: {loss:.3e} | memory: {mem:.2f} GB".format(
-        epoch=epoch,
-        loss=loss,
-        mem=mem_in_gb,
+    msg = (
+        "epoch info | epoch: {epoch} | loss: {loss:.3e} | memory: {mem:.2f} GB".format(
+            epoch=epoch,
+            loss=loss,
+            mem=mem_in_gb,
+        )
     )
     logger.info(msg)
 
@@ -114,15 +120,23 @@ def load_dataset(args):
     train_kwargs.update(accel_kwargs)
     test_kwargs.update(accel_kwargs)
     # Load dataset
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-    trainset = torchvision.datasets.MNIST(root_path, train=True, download=False, transform=transform)
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+    )
+    trainset = torchvision.datasets.MNIST(
+        root_path, train=True, download=False, transform=transform
+    )
     testset = torchvision.datasets.MNIST(root_path, train=False, transform=transform)
     # Create distributed samplers
     trainsampler = DistributedSampler(trainset)
     testsampler = DistributedSampler(testset)
     # Create loaders
-    trainloader = torch.utils.data.DataLoader(trainset, sampler=trainsampler, **train_kwargs)
-    testloader = torch.utils.data.DataLoader(testset, sampler=testsampler, **test_kwargs)
+    trainloader = torch.utils.data.DataLoader(
+        trainset, sampler=trainsampler, **train_kwargs
+    )
+    testloader = torch.utils.data.DataLoader(
+        testset, sampler=testsampler, **test_kwargs
+    )
     return trainloader, testloader
 
 
@@ -132,7 +146,9 @@ def residual_fn(a, b):
 
 def main():
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser = add_lema_arguments(
         parser,
         block_size=1024,
@@ -217,8 +233,10 @@ def main():
             for x, y in trainloader:
                 x = x.to(device)
                 y = y.to(device)
-                res = optim.step(x, y, shard_size=args.shard_size, slice_size=args.slice_size)
-                loss += res.loss
+                res = optim.step(
+                    x, y, shard_size=args.shard_size, slice_size=args.slice_size
+                )
+                loss += res.loss * res.batch_size
                 num_samples += res.batch_size
                 terminate = res.terminate
                 log_train(rank=rank, result=res, epoch=epoch, batch_start=batch_start)
@@ -228,7 +246,12 @@ def main():
                     terminate = True
                 if terminate:
                     break
-        log_epoch(rank=rank, epoch=epoch, loss=loss, mem_in_bytes=mem.peak_bytes)
+        log_epoch(
+            rank=rank,
+            epoch=epoch,
+            loss=loss / max(num_samples, 1),
+            mem_in_bytes=mem.peak_bytes,
+        )
         if terminate:
             break
         # Test
