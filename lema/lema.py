@@ -27,6 +27,7 @@ class LeMA(JacobianModel):
     _device: torch.device
     _optim_dtype: torch.dtype = torch.float32
     _gloo_group: dist.group
+    _eps: float = 1e-12
 
     class _Damping:
         val: float
@@ -208,6 +209,8 @@ class LeMA(JacobianModel):
         loss = r_block.square().sum().cpu()
         dist.all_reduce(loss, group=self._gloo_group)
         loss = loss.item()
+        # Compute the scaling D = diag(J^T J)
+        d = jtj.diagonal().clamp(min=self._eps)
         # Allocate memory for iterating
         update = self._template.new_empty(model_size)
         damped_jtj = self._template.new_empty((model_size, model_size))
@@ -218,7 +221,7 @@ class LeMA(JacobianModel):
             iterations += 1
             # Solve and update
             damped_jtj.copy_(jtj)
-            damped_jtj.diagonal().add_(self._damping.val)
+            damped_jtj.diagonal().add_(d, alpha=self._damping.val)
             torch.linalg.solve(damped_jtj, jtr, out=update)
             self._flat.sub_(update)
             # Check update criterion
@@ -270,11 +273,23 @@ class LeMA(JacobianModel):
         dist.all_gather_single(x_batch, x)
         dist.all_gather_single(y_batch, y)
 
+        # Compute the diagonal D = diag(J^T J)
+        d_inv = self._template.new_zeros(model_size)
+        for start, end in iter_batches(block_size, shard_size):
+            j_shard = self.jacrev(
+                x[start:end],
+                y[start:end],
+                slice_size=slice_size,
+            )
+            d_inv.add_(j_shard.square().sum(dim=0))
+        dist.all_reduce(d_inv)
+        d_inv.clamp_(min=self._eps).reciprocal_()
+
         # Allocate memory for products
         jjt_block = self._template.new_empty((block_size, batch_size))
         jjt = self._template.new_empty((batch_size, batch_size))
         r = self._template.new_empty(batch_size)
-        # Compute the products locally
+        # Compute the products J D^{-1} J^T locally
         compute_residual = True
         for start, end in iter_batches(block_size, shard_size):
             shard1 = self.jacrev(
@@ -282,6 +297,7 @@ class LeMA(JacobianModel):
                 y[start:end],
                 slice_size=slice_size,
             )
+            shard1.mul_(d_inv)
             for col_start, col_end in iter_batches(batch_size, shard_size):
                 shard = self.jacrev(
                     x_batch[col_start:col_end],
@@ -326,6 +342,7 @@ class LeMA(JacobianModel):
                     )
                 )
             dist.all_reduce(update)
+            update.mul_(d_inv)
             self._flat.sub_(update)
             # Check update criterion
             with torch.no_grad():
