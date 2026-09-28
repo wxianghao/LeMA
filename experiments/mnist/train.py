@@ -100,15 +100,36 @@ def log_epoch(rank: int, epoch: int, loss: float, mem_in_bytes: int):
     logger.info(msg)
 
 
-def log_test(rank: int, epoch: int, loss: float, acc: float):
+def log_test(rank: int, epoch: int, step: int, loss: float, acc: float):
     if rank != 0:
         return
-    msg = "test info | epoch: {epoch} | loss: {loss:.3e} | accuracy: {acc:.2%}".format(
+    msg = "test info | epoch: {epoch} | step: {step} | loss: {loss:.3e} | accuracy: {acc:.2%}".format(
         epoch=epoch,
+        step=step,
         loss=loss,
         acc=acc,
     )
     logger.info(msg)
+
+
+def evaluate(model: nn.Module, testloader, device) -> tuple[float, float]:
+    model.eval()
+    loss = torch.zeros((), device=device)
+    corrects = torch.zeros((), dtype=torch.long, device=device)
+    num_samples = torch.zeros((), dtype=torch.long, device=device)
+    with torch.no_grad():
+        for x, y in testloader:
+            x = x.to(device)
+            y = y.to(device)
+            output = model(x)
+            loss += F.nll_loss(output, y, reduction="sum")
+            corrects += (output.argmax(dim=1) == y).sum()
+            num_samples += y.numel()
+    dist.all_reduce(loss)
+    dist.all_reduce(corrects)
+    dist.all_reduce(num_samples)
+    model.train()
+    return loss.item() / num_samples.item(), corrects.item() / num_samples.item()
 
 
 def load_dataset(args):
@@ -170,7 +191,7 @@ def main():
         type=int,
         default=TEST_INTERVAL,
         metavar="N",
-        help=f"Interval of test",
+        help=f"Interval of test (in steps)",
     )
     parser.add_argument(
         "--data-dir",
@@ -242,6 +263,10 @@ def main():
                 log_train(rank=rank, result=res, epoch=epoch, batch_start=batch_start)
                 batch_start += res.batch_size
                 nsteps += 1
+                # Test
+                if nsteps % args.test_interval == 0:
+                    test_loss, test_acc = evaluate(model, testloader, device)
+                    log_test(rank=rank, epoch=epoch, step=nsteps, loss=test_loss, acc=test_acc)
                 if args.profile and nsteps >= args.profile_steps:
                     terminate = True
                 if terminate:
@@ -254,27 +279,6 @@ def main():
         )
         if terminate:
             break
-        # Test
-        if epoch % args.test_interval == 0:
-            model.eval()
-            loss = torch.zeros((), device=device)
-            corrects = torch.zeros((), dtype=torch.long, device=device)
-            num_samples = torch.zeros((), dtype=torch.long, device=device)
-            with torch.no_grad():
-                for x, y in testloader:
-                    x = x.to(device)
-                    y = y.to(device)
-                    output = model(x)
-                    loss += F.nll_loss(output, y, reduction="sum")
-                    corrects += (output.argmax(dim=1) == y).sum()
-                    num_samples += y.numel()
-            dist.all_reduce(loss)
-            dist.all_reduce(corrects)
-            dist.all_reduce(num_samples)
-            loss = loss.item() / num_samples.item()
-            accuracy = corrects.item() / num_samples.item()
-            log_test(rank=rank, epoch=epoch, loss=loss, acc=accuracy)
-            model.train()
 
     dist.destroy_process_group()
 
