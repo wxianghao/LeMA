@@ -1,8 +1,10 @@
 """
 Plot E8: peak memory of one LM trial step against the model size, for the standard and
-the dual form, each with the full Jacobian and with Jacobian shards.
+the dual form, each with the full Jacobian and with Jacobian shards, and optionally the
+components of the peak memory of selected runs of breakdown.py beside it.
 
-    python paper-experiments/memory_scaling/plot.py --input paper-experiments/memory_scaling/results/<run>/memory.jsonl
+    python paper-experiments/memory_scaling/plot.py --input paper-experiments/memory_scaling/results/<run>/memory.jsonl \
+        [--breakdown paper-experiments/memory_scaling/results/<run>/breakdown.jsonl]
     python paper-experiments/memory_scaling/plot.py --synthetic  # placeholder
 """
 
@@ -21,7 +23,7 @@ PAPER = os.path.join(os.path.dirname(REPO), "2027-ipdps-lema")
 
 # Categorical slots of the reference palette, in fixed order, as in strong_scaling/plot.py
 SLOTS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
-INK, MUTED = "#0b0b0b", "#52514e"
+INK, MUTED, NEUTRAL = "#0b0b0b", "#52514e", "#b9b8b2"
 
 # Color by form as in standard_vs_dual/plot.py, line style by the treatment of the Jacobian
 VARIANTS = {
@@ -29,6 +31,16 @@ VARIANTS = {
     "lema-standard": ("Standard, sharded $\\mathbf{J}$", SLOTS[1], "-", "s"),
     "full-dual": ("Dual, full $\\mathbf{J}$", SLOTS[0], (0, (3, 1.5)), "o"),
     "lema-dual": ("Dual, sharded $\\mathbf{J}$ (LeMA)", SLOTS[0], "-", "s"),
+}
+
+# Components of breakdown.py: (color, hatch), with the Jacobian, the Gram matrix, and Other as
+# in the phase breakdowns of strong_scaling/plot.py and split_k/plot.py
+COMPONENTS = {
+    "Jacobian": (SLOTS[0], ""),
+    "Gram matrix": (SLOTS[1], "////"),
+    "Vectors": (SLOTS[3], ""),
+    "Activations": (SLOTS[4], "\\\\\\\\"),
+    "Other": (NEUTRAL, ""),
 }
 
 plt.rcParams.update({
@@ -44,6 +56,7 @@ plt.rcParams.update({
     "xtick.major.width": 0.5,
     "ytick.major.width": 0.5,
     "legend.frameon": False,
+    "hatch.linewidth": 0.4,
     "pdf.fonttype": 42,
 })
 
@@ -53,8 +66,47 @@ def load(path):
         return [json.loads(line) for line in f]
 
 
-def plot(records, out, watermark):
-    fig, ax = plt.subplots(figsize=(3.5, 1.9))
+def sci(m):
+    """$M = 3.0 \\times 10^{7}$"""
+    exp = len(str(int(m))) - 1
+    return f"$M = {m / 10**exp:.1f} \\times 10^{{{exp}}}$"
+
+
+def plot_breakdown(ax, breakdown, capacity):
+    """Horizontal stacked bars of the components of the peak memory, one bar per run."""
+    labels, left = [], [0.0] * len(breakdown)
+    for comp, (color, hatch) in COMPONENTS.items():
+        widths = [r["components_gb"][comp] for r in breakdown]
+        ax.barh(range(len(breakdown)), widths, left=left, height=0.62, color=color, hatch=hatch, edgecolor="white",
+                linewidth=0.4, label=comp)
+        left = [a + w for a, w in zip(left, widths)]
+    for i, r in enumerate(breakdown):
+        # Inside the end of bars that reach the capacity line, right of the others
+        if left[i] > 0.8 * capacity:
+            ax.text(left[i] - 1, i, f"{r['peak_gb']:.1f}", va="center", ha="right", fontsize=5.5, color="white")
+        else:
+            ax.text(left[i] + 1, i, f"{r['peak_gb']:.1f}", va="center", ha="left", fontsize=5.5, color=INK)
+        # The variant without the "(LeMA)" of the legend of (a), and the model size
+        labels.append(f"{VARIANTS[r['variant']][0].replace(' (LeMA)', '')}, {sci(r['params'])}")
+    ax.axvline(capacity, color=MUTED, lw=0.6, ls=(0, (1, 1.5)))
+    ax.set_yticks(range(len(breakdown)), labels, fontsize=5.5)
+    ax.invert_yaxis()
+    ax.set_xlim(0, capacity * 1.08)
+    ax.set_xlabel("Peak memory (GB)")
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=5, fontsize=5.5, handlelength=1.0,
+              handleheight=0.9, columnspacing=0.8, borderaxespad=0.1)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(length=2, pad=1.5)
+    ax.grid(axis="x", color="#e4e3df", lw=0.4)
+    ax.set_axisbelow(True)
+
+
+def plot(records, out, watermark, breakdown=None):
+    if breakdown:
+        # Side by side across both columns, as the figure of convergence/plot.py
+        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(7.16, 1.85), gridspec_kw={"width_ratios": [1, 1]})
+    else:
+        fig, ax = plt.subplots(figsize=(3.5, 1.9))
     # Usable capacity reported by PyTorch, e.g., 85.1 GB = 79.25 GiB for an 80 GB A100
     capacity = max(r["gpu_mem_gb"] for r in records)
     ax.axhline(capacity, color=MUTED, lw=0.6, ls=(0, (1, 1.5)))
@@ -84,12 +136,17 @@ def plot(records, out, watermark):
     ax.tick_params(length=2, pad=1.5)
     ax.grid(axis="y", color="#e4e3df", lw=0.4, which="major")
     ax.set_axisbelow(True)
+    if breakdown:
+        # Same title padding in both panels, to clear the legend above (b)
+        ax.set_title("(a) Peak memory", fontsize=7, pad=11)
+        plot_breakdown(ax2, breakdown, capacity)
+        ax2.set_title("(b) Breakdown", fontsize=7, pad=11)
 
     if watermark:
         fig.text(0.5, 0.5, "SYNTHETIC DATA", fontsize=22, color="#d0021b", alpha=0.18,
                  ha="center", va="center", rotation=15, weight="bold")
 
-    fig.tight_layout(pad=0.2)
+    fig.tight_layout(pad=0.2, w_pad=1.0)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out, bbox_inches="tight", pad_inches=0.01)
     print(f"saved {out}")
@@ -99,11 +156,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--synthetic", action="store_true", help="plot fake data with a watermark")
     parser.add_argument("--input", default=None, help="memory.jsonl of a run.sh invocation")
+    parser.add_argument("--breakdown", default=None, help="breakdown.jsonl of breakdown.sh, plotted beside")
     parser.add_argument("--out", default=os.path.join(PAPER, "figures", "memory_scaling.pdf"))
     args = parser.parse_args()
     if args.input is None and not args.synthetic:
         parser.error("--input is required unless --synthetic is given")
-    plot(load(args.input or os.path.join(HERE, "synthetic", "memory.jsonl")), args.out, watermark=args.synthetic)
+    breakdown = load(args.breakdown) if args.breakdown else None
+    plot(load(args.input or os.path.join(HERE, "synthetic", "memory.jsonl")), args.out, watermark=args.synthetic,
+         breakdown=breakdown)
 
 
 if __name__ == "__main__":

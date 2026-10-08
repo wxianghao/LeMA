@@ -52,6 +52,19 @@ class LeNet5(nn.Module):
         return F.log_softmax(self.fc3(x), dim=1)
 
 
+class MLP(nn.Module):
+    """784-h-10 perceptron with ReLU, with 795 h + 10 parameters, e.g., 50,890 for h = 64."""
+
+    def __init__(self, hidden: int = 64):
+        super().__init__()
+        self.fc1 = nn.Linear(784, hidden)
+        self.fc2 = nn.Linear(hidden, 10)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(torch.flatten(x, 1)))
+        return F.log_softmax(self.fc2(x), dim=1)
+
+
 # Width of fc1 for each named WideCNN
 PRESETS = {
     "cnn-1m": 128,  # 1,199,882 parameters, same as experiments/mnist/train.py
