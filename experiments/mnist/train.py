@@ -90,12 +90,10 @@ def log_epoch(rank: int, epoch: int, loss: float, mem_in_bytes: int):
     if rank != 0:
         return
     mem_in_gb = mem_in_bytes / 1e9
-    msg = (
-        "epoch info | epoch: {epoch} | loss: {loss:.3e} | memory: {mem:.2f} GB".format(
-            epoch=epoch,
-            loss=loss,
-            mem=mem_in_gb,
-        )
+    msg = "epoch info | epoch: {epoch} | loss: {loss:.3e} | memory: {mem:.2f} GB".format(
+        epoch=epoch,
+        loss=loss,
+        mem=mem_in_gb,
     )
     logger.info(msg)
 
@@ -103,11 +101,13 @@ def log_epoch(rank: int, epoch: int, loss: float, mem_in_bytes: int):
 def log_test(rank: int, epoch: int, step: int, loss: float, acc: float):
     if rank != 0:
         return
-    msg = "test info | epoch: {epoch} | step: {step} | loss: {loss:.3e} | accuracy: {acc:.2%}".format(
-        epoch=epoch,
-        step=step,
-        loss=loss,
-        acc=acc,
+    msg = (
+        "test info | epoch: {epoch} | step: {step} | loss: {loss:.3e} | accuracy: {acc:.2%}".format(
+            epoch=epoch,
+            step=step,
+            loss=loss,
+            acc=acc,
+        )
     )
     logger.info(msg)
 
@@ -152,12 +152,8 @@ def load_dataset(args):
     trainsampler = DistributedSampler(trainset)
     testsampler = DistributedSampler(testset)
     # Create loaders
-    trainloader = torch.utils.data.DataLoader(
-        trainset, sampler=trainsampler, **train_kwargs
-    )
-    testloader = torch.utils.data.DataLoader(
-        testset, sampler=testsampler, **test_kwargs
-    )
+    trainloader = torch.utils.data.DataLoader(trainset, sampler=trainsampler, **train_kwargs)
+    testloader = torch.utils.data.DataLoader(testset, sampler=testsampler, **test_kwargs)
     return trainloader, testloader
 
 
@@ -167,9 +163,7 @@ def residual_fn(a, b):
 
 def main():
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser = add_lema_arguments(
         parser,
         block_size=1024,
@@ -254,9 +248,7 @@ def main():
             for x, y in trainloader:
                 x = x.to(device)
                 y = y.to(device)
-                res = optim.step(
-                    x, y, shard_size=args.shard_size, slice_size=args.slice_size
-                )
+                res = optim.step(x, y, shard_size=args.shard_size, slice_size=args.slice_size)
                 loss += res.loss * res.batch_size
                 num_samples += res.batch_size
                 terminate = res.terminate

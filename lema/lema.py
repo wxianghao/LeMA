@@ -1,9 +1,11 @@
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.distributed as dist
-
 from torch import nn
-from typing import Optional, Callable
-from dataclasses import dataclass
+
 from .jacobian import JacobianModel
 from .util import iter_batches
 
@@ -36,9 +38,7 @@ class LeMA(JacobianModel):
         maxval: float
         ratio: float
 
-        def __init__(
-            self, startval: float, minval: float, maxval: float, ratio: float
-        ) -> None:
+        def __init__(self, startval: float, minval: float, maxval: float, ratio: float) -> None:
             self.startval = startval
             self.minval = minval
             self.maxval = maxval
@@ -63,7 +63,7 @@ class LeMA(JacobianModel):
         self,
         model: nn.Module,
         residual_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-        model_dtype: Optional[torch.dtype] = None,
+        model_dtype: torch.dtype | None = None,
         optim_dtype: torch.dtype = torch.float32,
         max_iters: int = 10,
         damp_start: float = 1e-3,
@@ -90,9 +90,7 @@ class LeMA(JacobianModel):
 
         # Check model's device
         if self._device.type != "cuda":
-            raise RuntimeError(
-                f"Model should be on a CUDA device, but got {self._device.type}."
-            )
+            raise RuntimeError(f"Model should be on a CUDA device, but got {self._device.type}.")
 
         # Synchronize all processes' model parameters
         dist.broadcast(self._flat, 0)
@@ -117,12 +115,14 @@ class LeMA(JacobianModel):
         self._optim_dtype = optim_dtype
         self._template = torch.empty(0, device=self._device, dtype=self._optim_dtype)
 
+        self._model_dtype = model_dtype
+
     def step(
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        shard_size: Optional[int] = None,
-        slice_size: Optional[int] = None,
+        shard_size: int | None = None,
+        slice_size: int | None = None,
     ) -> LeMAResult:
         # Check inputs' devices
         if x.device != self._device or y.device != self._device:
@@ -249,6 +249,58 @@ class LeMA(JacobianModel):
             terminate=terminate,
         )
 
+    def step_dual(
+        self,
+        x_shard: torch.Tensor,
+        y_shard: torch.Tensor,
+        slice_size: None | int,
+        pack_size: None | int,
+        compute_local: bool = False,
+    ):
+        # Get dimension info
+        shard_size = x_shard.size(0)
+        model_size = self._flat.size(0)
+        batch_size, shard_start, shard_info_list = self._get_shard_info(shard_size)
+
+        # Get slicing information
+        slice_size = shard_size if slice_size is None else slice_size
+        slice_end = slice_start + slice_size
+        pack_size = slice_size if pack_size is None else pack_size
+
+        # Aggregate input tensors
+        x_batch = x_shard.new_empty((batch_size, *x_shard.size()[1:]))
+        y_batch = y_shard.new_empty((batch_size, *y_shard.size()[1:]))
+        dist.all_gather_single(x_batch, x_shard)
+        dist.all_gather_single(y_batch, y_shard)
+
+        # Compute the diagonal vector
+        d_inv = torch.zeros(model_size, dtype=self._model_dtype)
+        for slice_start, slice_end in iter_batches(shard_size, slice_size):
+            jslice = self.jacrev(
+                x_shard[slice_start:slice_end], y_shard[slice_start:slice_end], slice_size=pack_size
+            )
+            d_inv.add_(jslice.square().sum(dim=0))
+        dist.all_reduce(d_inv)
+        d_inv = d_inv.to(dtype=self._optim_dtype)
+        d_inv.clamp_(min=0.01 * d_inv.mean()).reciprocal_()  # Avoid division by zero
+
+        # Compute the dual matrix and the residual
+        dual_mat = torch.empty((batch_size, batch_size), dtype=self._optim_dtype)
+        for row_start, row_end in iter_batches(shard_size, slice_size):
+            jslice = self.jacrev(
+                x_shard[row_start:row_end], y_shard[row_start:row_end], slice_size=pack_size
+            ).to(dtype=self._optim_dtype)
+
+            dual_mat[slice_start:slice_end, slice_start:slice_end]
+
+            if compute_local:
+                # Computing other shards locally
+                for col_start, col_end in iter_batches(batch_size, slice_size):
+                    pass
+            else:
+                for i in range(1, self._world_size):
+                    
+
     def _step_underdetermined(
         self,
         x: torch.Tensor,
@@ -368,3 +420,15 @@ class LeMA(JacobianModel):
             iterations=iterations,
             terminate=terminate,
         )
+
+    def _get_shard_info(self, shard_size) -> tuple[int, int, list[tuple[int, int]]]:
+        shard_size_list = [None for _ in range(self._world_size)]
+        dist.all_gather_object(shard_size_list, shard_size, group=self._gloo_group)
+        batch_size = sum(shard_size_list)
+        shard_start = sum(shard_size_list[: self._rank])
+        shard_info_list = []
+        start = 0
+        for size in shard_size_list:
+            shard_info_list.append((start, size))
+            start += size
+        return batch_size, shard_start, shard_info_list
