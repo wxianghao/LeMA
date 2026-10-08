@@ -169,6 +169,17 @@ class LeMA(JacobianModel):
         res.damp = self._damping.val
         return res
 
+    @torch.no_grad()
+    def _compute_loss(self, x: torch.Tensor, y: torch.Tensor, slice_size: int) -> float:
+        # Accumulate the local loss slice by slice
+        loss = self._template.new_zeros(())
+        for start, end in iter_batches(x.size(0), slice_size):
+            loss.add_(self._loss_fn(self._model(x[start:end]), y[start:end]))
+        # All reduce the loss
+        loss = loss.cpu()
+        dist.all_reduce(loss, group=self._gloo_group)
+        return loss.item()
+
     def _step_overdetermined(
         self,
         x: torch.Tensor,
@@ -225,10 +236,7 @@ class LeMA(JacobianModel):
             torch.linalg.solve(damped_jtj, jtr, out=update)
             self._flat.sub_(update)
             # Check update criterion
-            with torch.no_grad():
-                new_loss = self._loss_fn(self._model(x), y).cpu()
-                dist.all_reduce(new_loss, group=self._gloo_group)
-                new_loss = new_loss.item()
+            new_loss = self._compute_loss(x, y, slice_size)
             if new_loss < loss:
                 # Succeed
                 loss = new_loss
@@ -333,7 +341,7 @@ class LeMA(JacobianModel):
             torch.linalg.solve(damped_jtj, r, out=solution)
             # Calculate the update
             update.zero_()
-            for start, end in iter_batches(block_size, shard_size):
+            for start, end in iter_batches(block_size, slice_size):
                 update.add_(
                     self.vjp(
                         x[start:end],
@@ -345,10 +353,7 @@ class LeMA(JacobianModel):
             update.mul_(d_inv)
             self._flat.sub_(update)
             # Check update criterion
-            with torch.no_grad():
-                new_loss = self._loss_fn(self._model(x), y).cpu()
-                dist.all_reduce(new_loss, group=self._gloo_group)
-                new_loss = new_loss.item()
+            new_loss = self._compute_loss(x, y, slice_size)
             if new_loss < loss:
                 # Succeed
                 loss = new_loss
