@@ -1,6 +1,6 @@
 """
-Write the E7 table: relative differences of the trial updates of both forms and their
-errors against the FP64 reference, as a LaTeX tabular for \\input in the paper.
+Write the E7 table: relative errors of the trial updates of both forms against the FP64
+reference, as a LaTeX tabular for \\input in the paper.
 
     python paper-experiments/update_equivalence/table.py --input paper-experiments/update_equivalence/results/<run>/updates.jsonl
     python paper-experiments/update_equivalence/table.py --synthetic  # placeholder in red
@@ -19,9 +19,11 @@ MODEL_LABELS = {"lenet5": "LeNet-5", "mlp": "MLP"}
 
 
 def sci(x: float) -> str:
-    """Two significant digits in LaTeX, e.g. $3.4 \\times 10^{-3}$."""
+    """Two significant digits in LaTeX, e.g. $3.4 \\times 10^{-3}$, or plain within [0.1, 10)."""
     if x == 0:
         return "$0$"
+    if 0.1 <= x < 10:
+        return f"${x:.2g}$"
     exp = math.floor(math.log10(x))
     mant = x / 10**exp
     if round(mant, 1) >= 10:
@@ -37,9 +39,9 @@ def power(x: float) -> str:
 def table(records, placeholder: bool) -> str:
     mark = (lambda s: f"\\textcolor{{red}}{{{s}}}") if placeholder else (lambda s: s)
     lines = [
-        "\\begin{tabular}{llcccc}",
+        "\\begin{tabular}{llccc}",
         "    \\hline",
-        "    Model & $N$ & $\\lambda$ & Std.\\ vs.\\ dual & Std.\\ vs.\\ FP64 & Dual vs.\\ FP64 \\\\",
+        "    Model & $N$ & $\\lambda$ & Standard form & Dual form \\\\",
     ]
     # One group of rows per (model, N), in the order of the records
     groups = list(dict.fromkeys((r["model"], r["batch_size"]) for r in records))
@@ -51,7 +53,8 @@ def table(records, placeholder: bool) -> str:
             model_cell = MODEL_LABELS.get(model, model) if model != last_model and i == 0 else ""
             n_cell = f"{n:,}" if i == 0 else ""
             cells = [model_cell, n_cell, power(r["damp"])]
-            cells += [mark(sci(r[k])) for k in ("diff_forms", "err_standard", "err_dual")]
+            # The difference between the forms is bounded by the sum of their errors, so it is not tabulated
+            cells += [mark(sci(r[k])) for k in ("err_standard", "err_dual")]
             lines.append("    " + " & ".join(cells) + " \\\\")
         last_model = model
     lines += ["    \\hline", "\\end{tabular}"]
