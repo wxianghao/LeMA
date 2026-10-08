@@ -1,7 +1,26 @@
+import functools
 import torch
 
 from torch import nn
 from typing import Callable, Tuple, Optional
+
+
+@functools.cache
+def _configure_backends() -> None:
+    # Compute in full FP32: cuDNN convolutions default to TF32, whose truncated
+    # mantissa perturbs the Jacobian rows
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    torch.backends.cudnn.conv.fp32_precision = "ieee"
+    torch.backends.cudnn.rnn.fp32_precision = "ieee"
+
+    # torch._native overrides aten::bmm of outer products, i.e., per-sample weight
+    # gradients, with a Triton kernel that offsets each batch by a 32-bit product and
+    # accesses illegal memory once the offset reaches 2^31. Fall back to cuBLAS.
+    try:
+        from torch._native import registry
+    except ImportError:
+        return
+    registry.deregister_op_overrides(disable_op_symbols="bmm")
 
 
 class JacobianModel(nn.Module):
@@ -26,6 +45,7 @@ class JacobianModel(nn.Module):
     ) -> None:
         super().__init__()
         self._model = model
+        _configure_backends()
 
         # Flatten the model parameters
         params = list(model.parameters())

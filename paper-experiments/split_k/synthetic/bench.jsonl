@@ -1,0 +1,34 @@
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.0006638646035618114, "rel_diff": 0.0, "m": 100002598, "s": 1, "bytes": 800020784, "flops": 200005196, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.0005077518231378708, "rel_diff": 1e-06, "m": 100002598, "s": 1, "bytes": 800020784, "flops": 200005196, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.012739329933271436, "rel_diff": 0.0, "m": 100002598, "s": 2, "bytes": 1600041568, "flops": 800020784, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.002285357934416251, "rel_diff": 1e-06, "m": 100002598, "s": 2, "bytes": 1600041568, "flops": 800020784, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.013070399749970967, "rel_diff": 0.0, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.0022727357258476764, "rel_diff": 1e-06, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 108, "time_s": 0.011623478145455165, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 216, "time_s": 0.005966638109999174, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 432, "time_s": 0.003294422303566098, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 864, "time_s": 0.0021440619356655464, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 1728, "time_s": 0.0023417448897784816, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 3456, "time_s": 0.0022864164540683757, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 6912, "time_s": 0.0022720826718683486, "m": 100002598, "s": 4, "bytes": 3200083136, "flops": 3200083136, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.013975048684690263, "rel_diff": 0.0, "m": 100002598, "s": 8, "bytes": 6400166272, "flops": 12800332544, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.006510728431929612, "rel_diff": 1e-06, "m": 100002598, "s": 8, "bytes": 6400166272, "flops": 12800332544, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.014087951325261677, "rel_diff": 0.0, "m": 100002598, "s": 16, "bytes": 12800332544, "flops": 51201330176, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.016814135697568133, "rel_diff": 1e-06, "m": 100002598, "s": 16, "bytes": 12800332544, "flops": 51201330176, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.019732017112272238, "rel_diff": 0.0, "m": 100002598, "s": 32, "bytes": 25600665088, "flops": 204805320704, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.17384780761197619, "rel_diff": 1e-06, "m": 100002598, "s": 32, "bytes": 25600665088, "flops": 204805320704, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.05891777086835968, "rel_diff": 0.0, "m": 100002598, "s": 64, "bytes": 51201330176, "flops": 819221282816, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.1687269611890673, "rel_diff": 1e-06, "m": 100002598, "s": 64, "bytes": 51201330176, "flops": 819221282816, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.006593904708869824, "rel_diff": 0.0, "m": 1000022632, "s": 1, "bytes": 8000181056, "flops": 2000045264, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.005119767354342839, "rel_diff": 1e-06, "m": 1000022632, "s": 1, "bytes": 8000181056, "flops": 2000045264, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.12941592547204955, "rel_diff": 0.0, "m": 1000022632, "s": 2, "bytes": 16000362112, "flops": 8000181056, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.023150171758822002, "rel_diff": 1e-06, "m": 1000022632, "s": 2, "bytes": 16000362112, "flops": 8000181056, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "mm", "chunks": 1, "time_s": 0.1274859313983068, "rel_diff": 0.0, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "block", "method": "split", "chunks": 1728, "time_s": 0.022767379491150763, "rel_diff": 1e-06, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 108, "time_s": 0.11504868582654482, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 216, "time_s": 0.06187494979805243, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 432, "time_s": 0.033914050232754296, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 864, "time_s": 0.021304387997317945, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 1728, "time_s": 0.023358667970924698, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 3456, "time_s": 0.02252918503751396, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}
+{"kind": "chunks", "chunks": 6912, "time_s": 0.02344344669523265, "m": 1000022632, "s": 4, "bytes": 32000724224, "flops": 32000724224, "synthetic": true, "sms": 108}

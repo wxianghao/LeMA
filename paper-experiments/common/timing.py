@@ -15,15 +15,16 @@ class PhaseTimer:
     the operations that ``lema/lema.py`` calls by attribute lookup:
 
         jacobian  LeMA.jacrev            Jacobian shard evaluation
-        gram      torch.mm               Gram block products
+        gram      LeMA._gram_block       Gram block products of the dual form (split-K or torch.mm)
+                  LeMA._gram_update      J^T J and J^T r accumulation of the standard form
         vjp       LeMA.vjp               J^T v of the dual form
         solve     torch.linalg.solve     damped linear solve
         comm      dist.all_reduce, dist.all_gather_single, dist.all_gather_object
 
     Everything else (loss evaluation, element-wise ops) is reported as "other".
     Every wrapped call synchronizes the device before and after, so a collective's
-    time includes waiting for the slowest rank. Nested calls (e.g. torch.mm inside
-    jacrev) are attributed to the outermost wrapped call.
+    time includes waiting for the slowest rank. Nested calls (e.g. a collective inside
+    another wrapped call) are attributed to the outermost wrapped call.
     """
 
     def __init__(self, optim):
@@ -52,7 +53,8 @@ class PhaseTimer:
         targets = [
             (self.optim, "jacrev", "jacobian"),
             (self.optim, "vjp", "vjp"),
-            (torch, "mm", "gram"),
+            (self.optim, "_gram_block", "gram"),
+            (self.optim, "_gram_update", "gram"),
             (torch.linalg, "solve", "solve"),
             (dist, "all_reduce", "comm"),
             (dist, "all_gather_single", "comm"),

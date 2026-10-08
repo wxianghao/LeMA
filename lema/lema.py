@@ -27,7 +27,18 @@ class LeMA(JacobianModel):
     _device: torch.device
     _optim_dtype: torch.dtype = torch.float32
     _gloo_group: dist.group
-    _eps: float = 1e-12
+    # Both forms clamp each diagonal element of D = diag(J^T J) to at least this ratio of
+    # their mean, which keeps D invertible and the damping effective for every parameter
+    _d_min_ratio: float = 0.01
+    # Split-K of the dual form's Gram blocks: number of chunks, applied automatically to
+    # shards of at most _split_k_max_rows rows, with chunks of at least _split_k_min_chunk
+    _split_k: int
+    _split_k_auto: bool
+    _split_k_max_rows: int = 8
+    _split_k_min_chunk: int = 4096
+    # Form of the LM equation: "auto" picks the standard form when N >= M and the dual
+    # form otherwise; "standard" and "dual" force one of them
+    _form: str
 
     class _Damping:
         val: float
@@ -70,6 +81,8 @@ class LeMA(JacobianModel):
         damp_ratio: float = 10.0,
         damp_min: float = 1e-1,
         damp_max: float = 1e9,
+        split_k: Optional[int] = None,
+        form: str = "auto",
     ) -> None:
         super().__init__(model=model, residual_fn=residual_fn, model_dtype=model_dtype)
 
@@ -117,6 +130,22 @@ class LeMA(JacobianModel):
         self._optim_dtype = optim_dtype
         self._template = torch.empty(0, device=self._device, dtype=self._optim_dtype)
 
+        # Config split-K, by default 16 chunks per SM for small shards
+        self._split_k_auto = split_k is None
+        if split_k is None:
+            split_k = (
+                16
+                * torch.cuda.get_device_properties(self._device).multi_processor_count
+            )
+        self._split_k = max(1, split_k)
+
+        # Config the form of the LM equation
+        if form not in ("auto", "standard", "dual"):
+            raise ValueError(
+                f"form should be 'auto', 'standard', or 'dual', but got {form!r}."
+            )
+        self._form = form
+
     def step(
         self,
         x: torch.Tensor,
@@ -139,7 +168,10 @@ class LeMA(JacobianModel):
         batch_size = sum(block_size_list)
 
         # Choose the execution path
-        overdetermined = batch_size >= model_size
+        if self._form == "auto":
+            overdetermined = batch_size >= model_size
+        else:
+            overdetermined = self._form == "standard"
 
         # overdetermined = batch_size > model_size
         if overdetermined:
@@ -180,6 +212,37 @@ class LeMA(JacobianModel):
         dist.all_reduce(loss, group=self._gloo_group)
         return loss.item()
 
+    def _gram_update(
+        self,
+        jtj: torch.Tensor,
+        jtr: torch.Tensor,
+        j_shard: torch.Tensor,
+        r_shard: torch.Tensor,
+    ) -> None:
+        # Accumulate a shard into J^T J and J^T r of the standard form
+        jtj.addmm_(j_shard.T, j_shard)
+        jtr.addmv_(j_shard.T, r_shard)
+
+    def _gram_block(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+        # Two S x M shards with S << M give a GEMM of only S x S outputs, which leaves
+        # most SMs idle. Split the inner dimension into chunks, multiply them in one
+        # batched GEMM, and sum the partial products (split-K).
+        k = a.size(1)
+        splits = min(self._split_k, k // self._split_k_min_chunk)
+        if self._split_k_auto and max(a.size(0), b.size(0)) > self._split_k_max_rows:
+            splits = 1
+        if splits <= 1:
+            torch.mm(a, b.T, out=out)
+            return
+        chunk = k // splits
+        main = chunk * splits
+        a_chunks = a[:, :main].unflatten(1, (splits, chunk)).transpose(0, 1)
+        b_chunks = b[:, :main].unflatten(1, (splits, chunk)).transpose(0, 1)
+        torch.sum(torch.bmm(a_chunks, b_chunks.transpose(1, 2)), dim=0, out=out)
+        # Add the remainder of the inner dimension
+        if main < k:
+            out.addmm_(a[:, main:], b[:, main:].T)
+
     def _step_overdetermined(
         self,
         x: torch.Tensor,
@@ -209,9 +272,10 @@ class LeMA(JacobianModel):
                 has_residual=True,
                 slice_size=slice_size,
             )
-            jtj.addmm_(j_shard.T, j_shard)
-            jtr.addmv_(j_shard.T, r_shard)
+            self._gram_update(jtj, jtr, j_shard, r_shard)
             r_block[start:end] = r_shard
+            # Free the shard before evaluating the next one
+            del j_shard, r_shard
         # All reduce the products
         dist.all_reduce(jtj)
         dist.all_reduce(jtr)
@@ -221,7 +285,8 @@ class LeMA(JacobianModel):
         dist.all_reduce(loss, group=self._gloo_group)
         loss = loss.item()
         # Compute the scaling D = diag(J^T J)
-        d = jtj.diagonal().clamp(min=self._eps)
+        d = jtj.diagonal()
+        d = d.clamp(min=self._d_min_ratio * d.mean())
         # Allocate memory for iterating
         update = self._template.new_empty(model_size)
         damped_jtj = self._template.new_empty((model_size, model_size))
@@ -289,9 +354,11 @@ class LeMA(JacobianModel):
                 y[start:end],
                 slice_size=slice_size,
             )
-            d_inv.add_(j_shard.square().sum(dim=0))
+            d_inv.add_(j_shard.square_().sum(dim=0))
+            # Free the shard before evaluating the next one
+            del j_shard
         dist.all_reduce(d_inv)
-        d_inv.clamp_(min=0.01 * d_inv.mean()).reciprocal_()
+        d_inv.clamp_(min=self._d_min_ratio * d_inv.mean()).reciprocal_()
 
         # Allocate memory for products
         jjt_block = self._template.new_empty((block_size, batch_size))
@@ -317,7 +384,12 @@ class LeMA(JacobianModel):
                     shard2, r[col_start:col_end] = shard
                 else:
                     shard2 = shard
-                torch.mm(shard1, shard2.T, out=jjt_block[start:end, col_start:col_end])
+                self._gram_block(
+                    shard1, shard2, out=jjt_block[start:end, col_start:col_end]
+                )
+                # Free the shard before evaluating the next one
+                del shard, shard2
+            del shard1
             compute_residual = False
         # All gather the product and the residual
         dist.all_gather_single(jjt, jjt_block)

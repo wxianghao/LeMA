@@ -1,0 +1,12 @@
+{"model": "lenet5", "params": 61706, "batch_size": 1024, "damp": 0.001, "ref_form": "dual", "diff_forms": 0.03, "err_standard": 0.03, "err_dual": 5e-05, "synthetic": true}
+{"model": "lenet5", "params": 61706, "batch_size": 1024, "damp": 1.0, "ref_form": "dual", "diff_forms": 0.0034, "err_standard": 0.0034, "err_dual": 6e-06, "synthetic": true}
+{"model": "lenet5", "params": 61706, "batch_size": 1024, "damp": 1000.0, "ref_form": "dual", "diff_forms": 2e-05, "err_standard": 2e-05, "err_dual": 1e-06, "synthetic": true}
+{"model": "lenet5", "params": 61706, "batch_size": 8192, "damp": 0.001, "ref_form": "dual", "diff_forms": 0.05, "err_standard": 0.05, "err_dual": 0.0001, "synthetic": true}
+{"model": "lenet5", "params": 61706, "batch_size": 8192, "damp": 1.0, "ref_form": "dual", "diff_forms": 0.005, "err_standard": 0.005, "err_dual": 1e-05, "synthetic": true}
+{"model": "lenet5", "params": 61706, "batch_size": 8192, "damp": 1000.0, "ref_form": "dual", "diff_forms": 3e-05, "err_standard": 3e-05, "err_dual": 2e-06, "synthetic": true}
+{"model": "mlp", "params": 12730, "batch_size": 4096, "damp": 0.001, "ref_form": "dual", "diff_forms": 0.02, "err_standard": 0.02, "err_dual": 0.0003, "synthetic": true}
+{"model": "mlp", "params": 12730, "batch_size": 4096, "damp": 1.0, "ref_form": "dual", "diff_forms": 0.0028, "err_standard": 0.0028, "err_dual": 2.7e-05, "synthetic": true}
+{"model": "mlp", "params": 12730, "batch_size": 4096, "damp": 1000.0, "ref_form": "dual", "diff_forms": 1e-05, "err_standard": 1e-05, "err_dual": 1e-06, "synthetic": true}
+{"model": "mlp", "params": 12730, "batch_size": 16384, "damp": 0.001, "ref_form": "standard", "diff_forms": 0.01, "err_standard": 0.0002, "err_dual": 0.01, "synthetic": true}
+{"model": "mlp", "params": 12730, "batch_size": 16384, "damp": 1.0, "ref_form": "standard", "diff_forms": 0.001, "err_standard": 2e-05, "err_dual": 0.001, "synthetic": true}
+{"model": "mlp", "params": 12730, "batch_size": 16384, "damp": 1000.0, "ref_form": "standard", "diff_forms": 1e-05, "err_standard": 1e-06, "err_dual": 1e-05, "synthetic": true}

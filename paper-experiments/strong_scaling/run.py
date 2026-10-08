@@ -39,7 +39,7 @@ for path in (repo_dir, exp_dir):
 
 import lema
 
-from common.models import WideCNN, PRESETS, residual_fn
+from common.models import MODELS, build_model, residual_fn
 from common.timing import PhaseTimer
 
 
@@ -57,17 +57,19 @@ def all_reduce_max(value: float, group) -> float:
 
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--model", choices=list(PRESETS), default="cnn-1b")
+    parser.add_argument("--model", choices=MODELS, default="cnn-1b")
     parser.add_argument("--hidden", type=int, default=None, help="fc1 width, overrides --model")
     parser.add_argument("--batch-size", type=int, default=256, help="global batch size N")
     parser.add_argument("--shard-size", type=int, default=4, help="shard size S")
     parser.add_argument("--slice-size", type=int, default=4, help="slice size L")
     parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--breakdown-steps", type=int, default=1)
     parser.add_argument("--data-dir", type=str, default=".data")
     parser.add_argument("--out", type=str, default="paper-experiments/strong_scaling/results/strong_scaling.jsonl")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--split-k", type=int, default=None, help="chunks of the Gram blocks, 1 disables split-K")
+    parser.add_argument("--form", choices=["auto", "standard", "dual"], default="auto", help="form of the LM equation")
     args = parser.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -89,12 +91,11 @@ def main():
         raise ValueError(f"{total_steps} steps of {n} samples exceed the training set")
 
     # Initialize the model directly on the device to avoid a host copy of 4 GB per process
-    hidden = args.hidden if args.hidden is not None else PRESETS[args.model]
-    model_name = args.model if args.hidden is None else f"cnn-h{hidden}"
+    model_name = args.model if args.hidden is None else f"cnn-h{args.hidden}"
     torch.manual_seed(args.seed)
     with torch.device(device):
-        model = WideCNN(hidden)
-    optim = lema.LeMA(model=model, residual_fn=residual_fn, max_iters=1)
+        model = build_model(args.model, args.hidden)
+    optim = lema.LeMA(model=model, residual_fn=residual_fn, max_iters=1, split_k=args.split_k, form=args.form)
     num_params = optim._flat.numel()
 
     if rank == 0:
@@ -136,6 +137,8 @@ def main():
             "batch_size": n,
             "shard_size": s,
             "slice_size": l,
+            "split_k": args.split_k,
+            "form": "standard" if res.overdetermined else "dual",
             "kind": kind,
             "step": k,
             "time_s": elapsed,
