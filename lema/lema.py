@@ -139,7 +139,7 @@ class LeMA(JacobianModel):
         batch_size = sum(block_size_list)
 
         # Choose the execution path
-        overdetermined = False
+        overdetermined = batch_size >= model_size
 
         # overdetermined = batch_size > model_size
         if overdetermined:
