@@ -1,14 +1,18 @@
 """
-E9: training a 784-64-10 MLP on MNIST with LeMA (dual or standard form), LM with a PCG solver, and Adam.
+E9: training a model on MNIST, e.g., a 784-64-10 MLP or CNN-1M, with LeMA (dual or standard form), LM with a
+PCG solver, and Adam.
 
 All methods start from the same parameters and minimize the same CE loss. The LM methods
 take steps on global batches of N samples, the k-th of which is the same for every
 method and every number of processes P, and process p takes the p-th contiguous N/P of
-it. Adam takes steps on mini-batches of B samples on one GPU. Every eval_every steps,
-rank 0 evaluates the CE loss on the full training set and the accuracy on the test set;
-the reported time accumulates only the training steps. The peak memory covers the
-training steps only, not the datasets or the evaluations. Each record is one JSON line in
---out.
+it. Adam takes steps on mini-batches of B samples on one GPU. A run either trains for
+--epochs epochs or, with --time-budget, until its training time reaches the budget. Rank 0
+evaluates the CE loss on the full training set and the accuracy on the test set before
+training and then every eval_every steps or, with --eval-interval, whenever the training
+time passes another multiple of the interval, and after the last step. The reported time
+accumulates only the training steps, each of which counts with its maximum over the
+processes. The peak memory covers the training steps only, not the datasets or the
+evaluations. Each record is one JSON line in --out.
 
 Launch (from the repository root):
     torchrun --standalone --nproc_per_node 8 paper-experiments/convergence/train.py --method lema-dual --out e9.jsonl
@@ -16,6 +20,7 @@ Launch (from the repository root):
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -34,7 +39,7 @@ for path in (repo_dir, exp_dir, os.path.dirname(os.path.abspath(__file__))):
 
 import lema
 
-from common.models import MLP, residual_fn
+from common.models import MLP, MODELS, build_model, residual_fn
 from pcg import PCGLM
 
 METHODS = ("adam", "lema-dual", "lema-standard", "pcg")
@@ -60,26 +65,37 @@ def evaluate(model, x_train, y_train, x_test, y_test, chunk=2048):
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--method", choices=METHODS, required=True)
+    parser.add_argument("--model", choices=["mlp", *MODELS], default="mlp", help="the MLP or a model of common.models")
     parser.add_argument("--hidden", type=int, default=64, help="hidden neurons of the MLP")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=10, help="epochs to train, unless --time-budget is given")
+    parser.add_argument("--time-budget", type=float, default=None, help="training time in seconds to train for")
     parser.add_argument("--batch-size", type=int, default=4096, help="global batch size N of the LM methods")
     parser.add_argument("--shard-size", type=int, default=512, help="shard size S of the LM methods")
     parser.add_argument("--slice-size", type=int, default=256, help="slice size L of the LM methods")
+    parser.add_argument("--damp-start", type=float, default=1e-3, help="initial damping factor of the LM methods")
+    parser.add_argument("--damp-ratio", type=float, default=10.0, help="factor by which the LM methods increase "
+                        "the damping after a rejected trial and decrease it after an accepted one")
     parser.add_argument("--cg-iters", type=int, default=100, help="maximum PCG iterations per solve")
     parser.add_argument("--adam-batch-size", type=int, default=128, help="mini-batch size B of Adam")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate of Adam")
     parser.add_argument("--eval-every", type=int, default=None, help="steps between evaluations (default: 1 for "
                         "the LM methods, 50 for Adam)")
+    parser.add_argument("--eval-interval", type=float, default=None, help="training time in seconds between "
+                        "evaluations, instead of --eval-every")
     parser.add_argument("--data-dir", type=str, default=".data")
     parser.add_argument("--out", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    # Full FP32 without TF32 for every method, as LeMA configures it, since Adam never
+    # constructs a LeMA object
+    lema.jacobian._configure_backends()
     dist.init_process_group(backend="nccl")
     rank, world_size = dist.get_rank(), dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    gloo = dist.new_group(backend="gloo")
     if args.method in ("adam", "pcg") and world_size != 1:
         raise ValueError(f"{args.method} runs on a single GPU")
 
@@ -90,7 +106,7 @@ def main():
 
     torch.manual_seed(args.seed)
     with torch.device(device):
-        model = MLP(args.hidden)
+        model = MLP(args.hidden) if args.model == "mlp" else build_model(args.model)
     num_params = sum(p.numel() for p in model.parameters())
 
     is_lm = args.method != "adam"
@@ -99,24 +115,31 @@ def main():
         if batch % world_size != 0:
             raise ValueError(f"Require P | N, got N={batch}, P={world_size}")
         if args.method == "pcg":
-            optim = PCGLM(model=model, residual_fn=residual_fn, cg_iters=args.cg_iters)
+            optim = PCGLM(model=model, residual_fn=residual_fn, cg_iters=args.cg_iters, damp_start=args.damp_start,
+                          damp_ratio=args.damp_ratio)
         else:
-            optim = lema.LeMA(model=model, residual_fn=residual_fn, form=args.method.split("-")[1])
+            optim = lema.LeMA(model=model, residual_fn=residual_fn, form=args.method.split("-")[1],
+                              damp_start=args.damp_start, damp_ratio=args.damp_ratio)
     else:
         optim = torch.optim.Adam(model.parameters(), lr=args.lr)
     eval_every = args.eval_every or (1 if is_lm else 50)
     block = batch // world_size
     steps_per_epoch = x_train.size(0) // batch  # drop the last partial batch
     label = args.method + (f"-{args.cg_iters}" if args.method == "pcg" else "")
-    base = {"method": label, "world_size": world_size, "model": f"mlp-{args.hidden}", "params": num_params, "batch_size": batch,
+    base = {"method": label, "world_size": world_size, "model": f"mlp-{args.hidden}" if args.model == "mlp" else args.model, "params": num_params, "batch_size": batch,
             "gpu": torch.cuda.get_device_name(device), "torch": torch.__version__}
     if is_lm:
-        base.update(shard_size=args.shard_size, slice_size=args.slice_size)
+        base.update(shard_size=args.shard_size, slice_size=args.slice_size, damp_start=args.damp_start,
+                    damp_ratio=args.damp_ratio)
+    if args.time_budget is not None:
+        base.update(time_budget=args.time_budget)
     if rank == 0:
         print(f"{label} | P: {world_size} | M: {num_params:,} | batch: {batch} | steps per epoch: {steps_per_epoch}",
               flush=True)
 
     records, train_time, peak, step = [], 0.0, 0, 0
+    # Cumulative counts of the LM methods over all steps so far
+    counts = {"trials": 0, "terminated": 0, "cg_iters": 0} if is_lm else {}
 
     def log(epoch_frac, extra):
         nonlocal peak
@@ -136,7 +159,9 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
 
     log(0.0, {})
-    for epoch in range(args.epochs):
+    next_eval = args.eval_interval
+    epoch, done = 0, False
+    while not done and (args.time_budget is not None or epoch < args.epochs):
         perm = torch.randperm(x_train.size(0), generator=torch.Generator().manual_seed(args.seed + epoch)).to(device)
         for k in range(steps_per_epoch):
             idx = perm[k * batch + rank * block : k * batch + (rank + 1) * block]
@@ -153,12 +178,36 @@ def main():
                 F.nll_loss(model(x), y).backward()
                 optim.step()
             torch.cuda.synchronize(device)
-            train_time += time.perf_counter() - tic
+            elapsed = time.perf_counter() - tic
+            if world_size > 1:
+                # The slowest process sets the step time, which also keeps the stopping decision
+                # of every process the same
+                t = torch.tensor([elapsed], dtype=torch.float64)
+                dist.all_reduce(t, op=dist.ReduceOp.MAX, group=gloo)
+                elapsed = t.item()
+            train_time += elapsed
             step += 1
-            if step % eval_every == 0 or k == steps_per_epoch - 1:
+            if is_lm:
+                counts["trials"] += res.iterations
+                counts["terminated"] += int(res.terminate)
                 if args.method == "pcg":
+                    counts["cg_iters"] += sum(optim.cg_iterations[-res.iterations:])
+            done = args.time_budget is not None and train_time >= args.time_budget
+            if args.eval_interval is not None:
+                due = train_time >= next_eval
+            else:
+                due = step % eval_every == 0 or k == steps_per_epoch - 1
+            if due or done:
+                if args.eval_interval is not None:
+                    # Every LM step is recorded with the cumulative counts instead of per step
+                    extra = {**({"damp": res.damp} if is_lm else {}), **{f"{k}_total": v for k, v in counts.items()}}
+                    next_eval = (math.floor(train_time / args.eval_interval) + 1) * args.eval_interval
+                elif args.method == "pcg":
                     extra["cg_iters"] = optim.cg_iterations[-res.iterations:]
                 log(epoch + (k + 1) / steps_per_epoch, extra)
+            if done:
+                break
+        epoch += 1
 
     # Peak memory per GPU over the training steps, maximized over the processes
     torch.cuda.synchronize(device)

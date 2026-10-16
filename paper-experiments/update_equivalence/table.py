@@ -23,7 +23,8 @@ def sci(x: float) -> str:
     if x == 0:
         return "$0$"
     if 0.1 <= x < 10:
-        return f"${x:.2g}$"
+        # Two significant digits with a trailing zero, e.g. 2.0 rather than 2
+        return f"${x:.1f}$" if x >= 1 else f"${x:.2f}$"
     exp = math.floor(math.log10(x))
     mant = x / 10**exp
     if round(mant, 1) >= 10:

@@ -3,12 +3,16 @@ E7: parameter update of the standard form vs the dual form on one GPU.
 
 From the same parameters, batch, and damping factor, LeMA performs one trial step
 with each form, and the script records the update of the trial, i.e., theta' - theta,
-before LeMA accepts or rejects it. An FP64 run of the cheaper form serves as the
-reference. Each record is one JSON line in --out with the relative differences
+before LeMA accepts or rejects it. The reference is the original LM equation
+(J^T J + lambda D) u = -J^T r in FP64, formed explicitly from the full Jacobian and solved
+directly, without LeMA's shards and solvers. Each record is one JSON line in --out with
+the relative differences
 
     diff_forms   ||u_standard - u_dual|| / ||u_ref||
     err_standard ||u_standard - u_ref|| / ||u_ref||
     err_dual     ||u_dual - u_ref|| / ||u_ref||
+    err_dual64   ||u_dual64 - u_ref|| / ||u_ref||, LeMA's dual form in FP64, which bounds the
+                 error of the reference itself where the original equation is ill-conditioned
 
 and the numbers of diagonal elements of J^T J that are zero, i.e., parameters without
 curvature such as those of dead ReLU units, and that both forms clamp to
@@ -85,6 +89,26 @@ def trial_update(name, form, damp, dtype, x, y, shard, slice_, seed):
     return updates[0], optim
 
 
+def reference_update(name, damp, x, y, slice_, seed):
+    """Update of the original LM equation in FP64 from freshly initialized parameters.
+
+    The full Jacobian J and J^T J are formed explicitly, and D = diag(J^T J) is clamped to
+    LeMA._d_min_ratio of its mean as in both forms of LeMA, so that all of them solve the
+    same system.
+    """
+    torch.manual_seed(seed)
+    with torch.device(x.device):
+        jm = lema.JacobianModel(MODELS[name](), residual_fn, model_dtype=torch.float64)
+    j, r = jm.jacrev(x.double(), y, has_residual=True, slice_size=slice_)
+    g = j.T @ r
+    a = j.T @ j
+    del j
+    d = a.diagonal().clone()
+    d.clamp_(min=lema.LeMA._d_min_ratio * d.mean())
+    a.diagonal().add_(d, alpha=damp)
+    return -torch.linalg.solve(a, g)
+
+
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--configs", nargs="+", default=[f"{name}:{n}" for name, n in CONFIGS],
@@ -122,11 +146,11 @@ def main():
         zero = int((d == 0).sum())
         clamped = int((d < lema.LeMA._d_min_ratio * d.mean()).sum())
         del probe, d
-        # FP64 reference with the form whose Gram matrix is smaller
-        ref_form = "dual" if m > n else "standard"
-
         for damp in args.damps:
-            u_ref, _ = trial_update(name, ref_form, damp, torch.float64, x, y, s, l, args.seed)
+            u_ref = reference_update(name, damp, x, y, l, args.seed)
+            torch.cuda.empty_cache()
+            u_dual64, _ = trial_update(name, "dual", damp, torch.float64, x, y, s, l, args.seed)
+            torch.cuda.empty_cache()
             u_std, _ = trial_update(name, "standard", damp, torch.float32, x, y, s, l, args.seed)
             torch.cuda.empty_cache()
             u_dual, _ = trial_update(name, "dual", damp, torch.float32, x, y, s, l, args.seed)
@@ -134,20 +158,21 @@ def main():
             norm = u_ref.norm().item()
             record = {
                 "model": name, "params": m, "batch_size": n, "shard_size": s, "slice_size": l, "damp": damp,
-                "ref_form": ref_form, "update_norm": norm,
+                "ref_form": "original-fp64", "update_norm": norm,
                 "diff_forms": (u_std - u_dual).norm().item() / norm,
                 "err_standard": (u_std - u_ref).norm().item() / norm,
                 "err_dual": (u_dual - u_ref).norm().item() / norm,
+                "err_dual64": (u_dual64 - u_ref).norm().item() / norm,
                 "num_zero": zero, "num_clamped": clamped, **env,
             }
             print(f"{name:6s} M={m:6,} N={n:6,} damp={damp:7.0e} | ||u||={norm:.3e} | std vs dual "
                   f"{record['diff_forms']:.1e} | std vs ref {record['err_standard']:.1e} | dual vs ref "
-                  f"{record['err_dual']:.1e} | D = 0: {zero:,} ({zero / m:.2%}), clamped: {clamped:,} "
+                  f"{record['err_dual']:.1e} | dual FP64 vs ref {record['err_dual64']:.1e} | D = 0: {zero:,} ({zero / m:.2%}), clamped: {clamped:,} "
                   f"({clamped / m:.2%})",
                   flush=True)
             with open(args.out, "a") as f:
                 f.write(json.dumps(record) + "\n")
-            del u_ref, u_std, u_dual
+            del u_ref, u_dual64, u_std, u_dual
 
     dist.destroy_process_group()
 

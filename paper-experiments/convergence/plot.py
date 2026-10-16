@@ -1,6 +1,6 @@
 """
-Plot E9: (a) training loss and (b) test accuracy against the training time, and (c) the peak
-memory per GPU, for LeMA's dual and standard form on 1 and 8 GPUs, LM with PCG, and Adam.
+Plot E9: (a) training loss and (b) test accuracy against the training time from t = 0, and
+(c) the peak memory per GPU, for LeMA's dual and standard form on 1 and 8 GPUs, LM with PCG, and Adam.
 
     python paper-experiments/convergence/plot.py --input paper-experiments/convergence/results/<run>
 """
@@ -63,27 +63,61 @@ def load(run_dir):
     return runs
 
 
+def summarize(runs):
+    """Numbers quoted in the paper: progress at the end and times to reach thresholds."""
+
+    def first_time(rs, ok):
+        return next((f"{r['time_s']:.1f}" for r in rs if ok(r)), "-")
+
+    print(f"{'run':24s} {'steps':>6s} {'epochs':>6s} {'time':>6s} {'loss':>7s} {'acc':>7s} {'t(l<0.1)':>8s} "
+          f"{'t(l<0.05)':>9s} {'t(acc>=97%)':>11s} {'trials':>6s} {'mem GB':>7s}")
+    for key in [k for k in RUNS if k in runs]:
+        rs = runs[key]
+        last = rs[-1]
+        print(f"{RUNS[key][0]:24s} {last['step']:6d} {last['epoch']:6.2f} {last['time_s']:6.1f} "
+              f"{last['train_loss']:7.4f} {last['test_acc']:7.2%} {first_time(rs, lambda r: r['train_loss'] < 0.1):>8s} "
+              f"{first_time(rs, lambda r: r['train_loss'] < 0.05):>9s} {first_time(rs, lambda r: r['test_acc'] >= 0.97):>11s} "
+              f"{last.get('trials_total', '-'):>6} {last['peak_mem_gb']:7.2f}")
+
+
 def plot(runs, out):
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(7.16, 1.85), gridspec_kw={"width_ratios": [1, 1, 0.85]})
     keys = [k for k in RUNS if k in runs]
 
-    # (a, b) Training loss and test accuracy against the training time, from the first step on
+    # (a, b) Training loss and test accuracy against the training time from t = 0, where every
+    # run starts from the same parameters and thus from the same evaluation
+    start = [runs[k][0] for k in keys]
+    assert all(r["step"] == 0 and r["time_s"] == 0 for r in start)
+    loss0, acc0 = start[0]["train_loss"], start[0]["test_acc"]
+    spread = max(max(abs(r["train_loss"] - loss0), abs(r["test_acc"] - acc0)) for r in start)
+    print(f"t = 0: training loss {loss0:.4f} | test accuracy {acc0:.2%} | max difference between runs {spread:.1e}")
+    budget = max(r.get("time_budget", r["time_s"]) for k in keys for r in runs[k])
     for key in keys:
         label, color, ls = RUNS[key]
         rs = [r for r in runs[key] if r["step"] > 0]
-        t = [r["time_s"] for r in rs]
-        ax1.plot(t, [r["train_loss"] for r in rs], color=color, ls=ls, lw=1.0, label=label)
-        ax2.plot(t, [100 * r["test_acc"] for r in rs], color=color, ls=ls, lw=1.0)
+        t = [0.0] + [r["time_s"] for r in rs]
+        ax1.plot(t, [loss0] + [r["train_loss"] for r in rs], color=color, ls=ls, lw=1.0, label=label)
+        ax2.plot(t, [acc0] + [r["test_acc"] for r in rs], color=color, ls=ls, lw=1.0)
     plain = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
     for ax in (ax1, ax2):
-        ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(plain)
+        ax.set_xlim(0, budget)
         ax.set_xlabel("Training time (s)")
     ax1.set_yscale("log")
-    ax1.yaxis.set_major_formatter(plain)
+    # Bound the axis by the LM methods, so that Adam, which can drive the loss to zero, runs off
+    # the bottom instead of flattening the other curves
+    lm_min = min(r["train_loss"] for k in keys if k[0] != "adam" for r in runs[k] if r["train_loss"] > 0)
+    ax1.set_ylim(lm_min / 5, loss0 * 2)
+    ax1.yaxis.set_major_locator(matplotlib.ticker.LogLocator(numticks=12))
+    ax1.yaxis.set_major_formatter(matplotlib.ticker.LogFormatterMathtext())
     ax1.set_ylabel("Training loss")
     ax1.set_title("(a) Training loss", fontsize=7, pad=3)
-    ax2.set_ylim(90, 98.5)
+    # A logit scale keeps both the start near 10% and the differences near 98% readable
+    ax2.set_yscale("logit")
+    acc_max = max(r["test_acc"] for k in keys for r in runs[k])
+    ax2.set_yticks([v for v in (0.1, 0.5, 0.9, 0.95, 0.98, 0.99) if v <= acc_max])
+    ax2.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{100 * v:g}"))
+    ax2.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax2.set_ylim(min(acc0, 0.1) * 0.9, 1 - (1 - acc_max) / 1.5)
     ax2.set_ylabel("Test accuracy (%)")
     ax2.set_title("(b) Test accuracy", fontsize=7, pad=3)
 
@@ -122,7 +156,9 @@ def main():
     parser.add_argument("--input", required=True, help="run directory of run.sh")
     parser.add_argument("--out", default=os.path.join(PAPER, "figures", "convergence.pdf"))
     args = parser.parse_args()
-    plot(load(args.input), args.out)
+    runs = load(args.input)
+    summarize(runs)
+    plot(runs, args.out)
 
 
 if __name__ == "__main__":
